@@ -23,7 +23,7 @@ const quant = {
     { at: 0.16, h: 'Half the bytes, twice the tokens',
       p: (s) => { const d1 = decodeStep({ batch: 1, precision: s.precision }); return `You are at ${prec(s.precision).label}: ${fmtBytes(weightBytes(s.precision))} of weights, ${(d1.seconds * 1e3).toFixed(2)} ms a token, ${fmtInt(d1.perUserTokensPerSec)} tok/s. Press <b>Q</b> and watch every memory-bound number move together — fp16 → int8 → int4 runs 207 → 415 → 830 tok/s. Nothing else in this film is that clean a trade.`; } },
     { at: 0.36, h: 'How: integers plus a scale',
-      p: 'The mechanism is humble: a group of weights shares one floating-point <b>scale</b>; each weight becomes a small integer times that scale. The integers travel over the wire; the cores dequantize into registers and the matmul still runs in 16-bit math. Fewer bytes in flight, same arithmetic.' },
+      p: 'The mechanism is humble: a group of weights shares one floating-point <b>scale</b>; each weight becomes a small integer times that scale. The integers travel over the wire; the cores dequantize into registers and the matmul still runs in 16-bit math. Fewer bytes in flight, same arithmetic. (One honest note: this film’s Q toggle shrinks the KV cache along with the weights — real stacks quantize KV separately, often to fp8.)' },
     { at: 0.55, h: 'The enemy: outliers',
       p: 'Watch the number line: values snap to the nearest rung of the integer grid, and the error is tiny — until one <b>outlier</b> stretches the scale and crowds everyone else onto a few rungs. This is why naive quantization breaks, and why real methods use per-group scales and calibration: GPTQ rounds so errors cancel; AWQ protects the channels activations actually use.' },
     { at: 0.74, h: 'The capacity dividend',
@@ -134,7 +134,9 @@ const quant = {
 };
 
 // --- 8 · speculative decoding ------------------------------------------------
-const ACCEPT_PATTERNS = { 0.9: [4, 3, 4, 4, 2, 4, 4, 3, 4, 4], 0.7: [2, 1, 3, 1, 2, 1, 3, 1, 2, 2], 0.4: [1, 0, 1, 2, 0, 1, 0, 1, 0, 1] };
+// per-cycle accepted counts; each list averages E[accepted] = a+a²+a³+a⁴
+// (0.9 → 3.1, 0.7 → 1.8, 0.4 → 0.65) so the animation matches the stated math
+const ACCEPT_PATTERNS = { 0.9: [4, 3, 4, 2, 3, 4, 2, 3, 3, 3], 0.7: [2, 1, 3, 1, 2, 1, 3, 1, 2, 2], 0.4: [1, 0, 1, 2, 0, 1, 0, 1, 0, 1] };
 
 const spec = {
   id: 'spec',
@@ -148,14 +150,14 @@ const spec = {
     { at: 0.00, h: 'Batching never helped you',
       p: 'Throughput tricks share the machine among <i>more</i> users; the single user typing at a chatbot got nothing — at batch 32 they got slower. To make <b>one person’s</b> tokens come faster, something else is needed. Look back at the idle 99.7% of the cores. That is unspent money.' },
     { at: 0.16, h: 'Verification is nearly free',
-      p: 'The key asymmetry: checking k+1 candidate tokens in one forward pass costs the <i>same 14 GB sweep</i> as generating one — a few extra rows of math riding a read that was happening anyway. It is a miniature prefill. Generating serially is expensive; judging in parallel is not.' },
+      p: (s) => `The key asymmetry: checking k+1 candidate tokens in one forward pass costs the <i>same ${fmtBytes(weightBytes(s.precision) + kvBytesPerSeq(s.precision))} sweep</i> decode already pays for one — a few extra rows of math riding a read that was happening anyway. It is a miniature prefill. Generating serially is expensive; judging in parallel is not.` },
     { at: 0.34, h: 'So let something small guess',
-      p: (s) => `A draft model ~1/20th the size (${fmtBytes(DRAFT.params * prec(s.precision).bytes)} of weights) burns through <b>k = ${DRAFT.k} quick guesses</b> — all four together cost ${(DRAFT.k * DRAFT.params * prec(s.precision).bytes / GPU.bandwidth * 1e3).toFixed(2)} ms of memory traffic. The guesses are cheap and often right: language is full of boilerplate the small model nails.` },
+      p: (s) => `A draft model ~1/20th the size (${fmtBytes(DRAFT.params * prec(s.precision).bytes)} of weights) burns through <b>k = ${DRAFT.k} quick guesses</b> — all four together cost ${(DRAFT.k * DRAFT.params * prec(s.precision).bytes / GPU.bandwidth * 1e3).toFixed(2)} ms of memory traffic (we ignore the draft’s own small KV). The guesses are cheap and often right: language is full of boilerplate the small model nails.` },
     { at: 0.52, h: 'One sweep judges them all',
-      p: 'The target model runs a single pass over all the guesses at once. The longest agreeing prefix is <b>accepted</b>; the first disagreement is replaced by the target’s own choice — the <i>bonus token</i> — and the rest are discarded. With rejection-sampling acceptance, the output distribution is <b>mathematically identical</b> to the target model alone. Speculation cannot make the model dumber. Only faster or slower.' },
+      p: 'The target model runs a single pass over all the guesses at once. The longest agreeing prefix is <b>accepted</b>; the first disagreement is replaced by the target’s own choice — the <i>bonus token</i> — and the rest are discarded. With rejection-sampling acceptance, the output distribution is <b>mathematically identical</b> to the target model alone — the deep dive sketches the accept/resample rule that guarantees it. Speculation cannot make the model dumber. Only faster or slower.' },
     { at: 0.72, h: 'The arithmetic of luck',
       p: (s) => { const one = { ...s, batch: 1 }; return s.spec
-        ? `Expected tokens per cycle: 1 + a + a² + a³ + a⁴. At acceptance a=${s.spec} that is <b>${specYield(s.spec).toFixed(2)} tokens</b> per ~${(throughput(one).seconds * 1e3).toFixed(1)} ms cycle — <b>${fmtInt(throughput(one).perUserTokensPerSec)} tok/s, ${fmtX(throughput(one).specMult)} faster</b> for that one user. Press S to change the acceptance rate: predictable text (code, forms) sits near 0.9; freewheeling prose sinks toward 0.4.`
+        ? `Expected tokens per cycle: 1 + a + a² + a³ + a⁴ — modelling each guess as an independent coin at rate a. At acceptance a=${s.spec} that is <b>${specYield(s.spec).toFixed(2)} tokens</b> per ~${(throughput(one).seconds * 1e3).toFixed(1)} ms cycle — <b>${fmtInt(throughput(one).perUserTokensPerSec)} tok/s, ${fmtX(throughput(one).specMult)} faster</b> for that one user. Press S to change the acceptance rate: predictable text (code, forms) sits near 0.9; freewheeling prose sinks toward 0.4.`
         : 'Speculation is off. Press <b>S</b> to pick an acceptance rate and watch the same cycle with guesses in flight.'; } },
     { at: 0.90, h: 'Nothing is free',
       p: 'Total FLOPs and energy go <i>up</i> — the draft runs, and rejected positions are wasted work. Speculation converts idle compute into latency; when the batch is already large there is no idle compute to spend, and it stops paying. The deep dive covers EAGLE, Medusa, and tree speculation.' },
@@ -293,13 +295,13 @@ const roofline = {
     { at: 0.20, h: 'Decode lives in the corner',
       p: 'Plain decode sits at the far bottom-left — intensity below 1, pinned to the memory slope, using a fraction of a percent of the machine. Prefill sits past the ridge on the flat roof, compute-bound. <b>The whole economics of inference is the distance between those two dots.</b>' },
     { at: 0.42, h: 'Every technique is a move on this map',
-      p: 'Batching slides decode right along the memory roof — more math per byte, same wire. Quantization shrinks the bytes so the same position pays out more tokens. <b>This is the playground: drag to orbit, and work the B, Q, S buttons — the bright dot is your current configuration, live.</b>' },
+      p: 'Batching slides decode right along the memory roof — more math per byte, same wire. Quantization shrinks the bytes, so the dot slides right too and every sweep finishes sooner. <b>This is the playground: drag to orbit, and work the B, Q, S buttons — the bright dot is your current configuration, live.</b>' },
     { at: 0.66, h: 'Speculation farms the empty sky',
       p: (s) => s.spec
-        ? `The gap between the dot and the roofs is idle compute. Speculative decoding doesn’t move the dot — it harvests the gap: the beam shows ${fmtX(throughput(s).specMult)} useful tokens per sweep at acceptance ${s.spec}.`
+        ? `The gap between the dot and the roofs is idle compute. Speculative decoding doesn’t move the dot — it harvests the gap: the beam shows the ${fmtX(throughput({ ...s, batch: 1 }).specMult)} wall-clock speedup bought at acceptance ${s.spec}.`
         : 'The gap between the dot and the roofs is idle compute — speculation’s bankroll. Press S to see it harvested.' },
     { at: 0.84, h: 'Same silicon, opposite corners',
-      p: 'A chat product buys latency: small batches, speculation, aggressive quantization. A batch API sells throughput: huge batches, no speculation. Identical hardware, opposite corners of this chart — and that is why batch tokens are priced at roughly half. The deep dive closes the story: multiple GPUs, MoE, and where to read next.' },
+      p: 'A chat product buys latency: small batches, speculation, aggressive quantization. A batch API sells throughput: huge batches, no speculation. Identical hardware, opposite corners of this chart — and the cost sheet is one division: a GPU-hour’s price ÷ tokens served that hour = $/token. That is why batch tokens are priced at roughly half. The deep dive closes the story: multiple GPUs, MoE, and where to read next.' },
   ],
   build(ctx) {
     inspector.begin();
