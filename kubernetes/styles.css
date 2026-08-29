@@ -1,0 +1,746 @@
+/* ── Harbour chart at dusk ─────────────────────────────────────────────
+   Deep navy water for the 3D cluster; chart-paper cards floating on top
+   of it, so every word sits on a calm opaque surface and stays readable
+   no matter what the scene is doing behind it. */
+
+:root {
+  --ink:        #0B1A2B;
+  --ink-2:      #12283F;
+  --ink-3:      #1D3A57;
+  --paper:      #F2EDE3;
+  --paper-2:    #E1D9C8;
+  --paper-3:    #C8BEA9;
+  --kube:       #4C7EF3;
+  --kube-soft:  #A9C2FB;
+  --signal:     #FF6B35;
+  --go:         #2FBF7E;
+  --dim:        #6C7F94;
+
+  --card-w: clamp(310px, 26vw, 430px);
+  --pad: clamp(18px, 1.6vw, 26px);
+  --r: 3px;
+
+  --display: "Bricolage Grotesque", "Trebuchet MS", system-ui, sans-serif;
+  --body: "Instrument Sans", "Helvetica Neue", Arial, sans-serif;
+  --data: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: var(--ink);
+  color: var(--paper);
+  font-family: var(--body);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* time left in the current chapter before autoplay moves on */
+#chapbar {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: 3px;
+  z-index: 7;
+  pointer-events: none;
+}
+
+#chapbar i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: var(--signal);
+  opacity: .85;
+}
+
+.gate-alt {
+  display: inline-block;
+  margin-left: 16px;
+  font-size: 13px;
+  color: var(--ink);
+  text-decoration-color: var(--signal);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+.gate-alt:hover { color: var(--signal); }
+
+/* ── 3D stage ─────────────────────────────────────────────────────── */
+
+#stage, #labels {
+  position: fixed;
+  inset: 0;
+}
+
+#labels {
+  pointer-events: none;
+  overflow: hidden;
+}
+
+/* Labels drawn into the scene by CSS2DRenderer. Small, uppercase,
+   monospaced — they read as chart annotations, not UI. */
+.tag {
+  font-family: var(--data);
+  font-size: 10.5px;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  color: var(--paper);
+  background: rgba(11, 26, 43, .78);
+  border: 1px solid rgba(242, 237, 227, .22);
+  border-radius: 2px;
+  padding: 3px 7px;
+  white-space: nowrap;
+  transform: translateY(-2px);
+  backdrop-filter: blur(2px);
+}
+.tag.is-kube   { color: var(--kube-soft); border-color: rgba(76, 126, 243, .55); }
+.tag.is-signal { color: #FFC0A4;          border-color: rgba(255, 107, 53, .55); }
+.tag.is-go     { color: #9CE9C6;          border-color: rgba(47, 191, 126, .5); }
+.tag.is-dead   { color: #FF9C7A;          border-color: rgba(255, 107, 53, .8); background: rgba(58, 16, 6, .85); }
+.tag.is-quiet  { color: var(--dim);        border-color: rgba(108, 127, 148, .3); }
+.tag.is-big {
+  font-family: var(--display);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: .02em;
+  text-transform: none;
+  padding: 5px 10px;
+}
+
+/* ── Masthead ─────────────────────────────────────────────────────── */
+
+#mast {
+  position: fixed;
+  top: clamp(16px, 2.2vh, 28px);
+  left: clamp(16px, 2vw, 30px);
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  z-index: 5;
+}
+
+#mast .mark {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  font-size: 21px;
+  color: var(--ink);
+  background: var(--kube);
+  border-radius: 50%;
+}
+
+#mast h1 {
+  margin: 0;
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: 21px;
+  letter-spacing: -.02em;
+  line-height: 1;
+}
+
+#mast p {
+  margin: 3px 0 0;
+  font-size: 11.5px;
+  letter-spacing: .04em;
+  color: var(--dim);
+}
+
+/* ── Reconcile ledger ─────────────────────────────────────────────── */
+
+#ledger {
+  position: fixed;
+  top: clamp(16px, 2.2vh, 28px);
+  right: clamp(16px, 2vw, 30px);
+  z-index: 5;
+  width: 216px;
+  padding: 14px 16px 13px;
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: var(--r);
+  box-shadow: 0 18px 40px -18px rgba(0, 0, 0, .8);
+}
+
+/* torn-paper top edge, so the ledger reads as a slip pinned to the chart */
+#ledger::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  background: repeating-linear-gradient(90deg, var(--signal) 0 9px, transparent 9px 15px);
+}
+
+.led-head {
+  font-family: var(--data);
+  font-size: 9.5px;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--paper-3);
+  margin-bottom: 9px;
+}
+
+.led-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 0;
+}
+
+.led-key {
+  font-family: var(--data);
+  font-size: 10px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ink);
+  opacity: .55;
+}
+
+.led-val {
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: 30px;
+  line-height: .9;
+  font-variant-numeric: tabular-nums;
+  transition: color .3s ease;
+}
+
+#led-desired { color: var(--signal); }
+#led-actual  { color: var(--ink); }
+#led-actual.is-match { color: var(--go); }
+
+.led-foot {
+  margin: 10px 0 0;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--dim);
+}
+
+.led-gap {
+  margin-top: 11px;
+  padding-top: 10px;
+  border-top: 1px solid var(--paper-2);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.led-bar {
+  flex: 1;
+  height: 5px;
+  background: var(--paper-2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.led-bar i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: var(--go);
+  transition: width .45s cubic-bezier(.2, .8, .3, 1), background .3s;
+}
+
+.led-bar i.is-gap { background: var(--signal); }
+
+.led-state {
+  font-family: var(--data);
+  font-size: 9.5px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  min-width: 76px;
+  text-align: right;
+}
+
+
+/* ── Opening gate ─────────────────────────────────────────────────── */
+
+#gate {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(6, 15, 25, .74);
+  backdrop-filter: blur(3px);
+  transition: opacity .45s ease;
+}
+
+#gate.is-gone {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.gate-card {
+  width: min(560px, 100%);
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: clamp(22px, 3vw, 38px);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: var(--r);
+  box-shadow: 0 40px 90px -30px rgba(0, 0, 0, .9);
+}
+
+.gate-eyebrow {
+  margin: 0 0 12px;
+  font-family: var(--data);
+  font-size: 10.5px;
+  letter-spacing: .17em;
+  text-transform: uppercase;
+  color: var(--signal);
+}
+
+.gate-title {
+  margin: 0 0 14px;
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: clamp(26px, 3.4vw, 40px);
+  line-height: 1.05;
+  letter-spacing: -.025em;
+  text-wrap: balance;
+}
+
+.gate-body {
+  margin: 0 0 22px;
+  font-size: 16px;
+  line-height: 1.55;
+  color: #23384D;
+}
+
+.gate-btn {
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: 16px;
+  letter-spacing: -.01em;
+  color: var(--paper);
+  background: var(--ink);
+  border: 0;
+  border-radius: 2px;
+  padding: 13px 22px;
+  cursor: pointer;
+  transition: background .18s, transform .18s;
+}
+
+.gate-btn:hover { background: var(--kube); }
+.gate-btn:active { transform: translateY(1px); }
+
+.gate-keys {
+  display: grid;
+  grid-template-columns: 108px 1fr;
+  gap: 0;
+  margin: 24px 0 0;
+  border-top: 1px solid var(--paper-2);
+}
+
+.gate-keys dt {
+  padding: 11px 0;
+  border-bottom: 1px solid var(--paper-2);
+  font-family: var(--data);
+  font-size: 11px;
+  letter-spacing: .03em;
+  color: var(--ink);
+}
+
+.gate-keys dd {
+  margin: 0;
+  padding: 11px 0 11px 12px;
+  border-bottom: 1px solid var(--paper-2);
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: #33475C;
+}
+
+kbd {
+  font-family: var(--data);
+  font-size: 11px;
+  color: var(--ink);
+  background: var(--paper-2);
+  border-radius: 2px;
+  padding: 2px 5px;
+}
+
+/* Label the chapters that hand over the controls. */
+.try-label {
+  margin: 0;
+  font-family: var(--data);
+  font-size: 10px;
+  letter-spacing: .17em;
+  text-transform: uppercase;
+  color: var(--signal);
+}
+
+/* ── Chapter card ─────────────────────────────────────────────────── */
+
+#card {
+  position: fixed;
+  left: clamp(16px, 2vw, 30px);
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 5;
+  width: var(--card-w);
+  max-height: 74vh;
+  overflow-y: auto;
+  padding: var(--pad);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: var(--r);
+  box-shadow: 0 26px 60px -24px rgba(0, 0, 0, .85);
+  scrollbar-width: thin;
+}
+
+.card-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.chip {
+  font-family: var(--data);
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: .06em;
+  color: var(--paper);
+  background: var(--ink);
+  padding: 4px 7px;
+  border-radius: 2px;
+}
+
+.kicker {
+  font-family: var(--data);
+  font-size: 10px;
+  letter-spacing: .17em;
+  text-transform: uppercase;
+  color: var(--signal);
+}
+
+#c-title {
+  margin: 0 0 12px;
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: clamp(23px, 2.1vw, 31px);
+  line-height: 1.08;
+  letter-spacing: -.022em;
+  text-wrap: balance;
+}
+
+#c-body {
+  margin: 0;
+  font-size: 15.5px;
+  line-height: 1.55;
+  color: #23384D;
+}
+
+#c-body b {
+  font-weight: 600;
+  color: var(--ink);
+  box-shadow: inset 0 -.45em 0 rgba(76, 126, 243, .2);
+}
+
+#c-list {
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--paper-2);
+}
+
+#c-list li {
+  display: grid;
+  grid-template-columns: 102px 1fr;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--paper-2);
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: #33475C;
+}
+
+#c-list li em {
+  font-style: normal;
+  font-family: var(--data);
+  font-size: 11.5px;
+  letter-spacing: .02em;
+  color: var(--ink);
+  line-height: 1.35;
+  padding-top: 1px;
+}
+
+#c-list:empty { display: none; }
+
+#c-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+#c-actions:empty { display: none; }
+
+.act {
+  font-family: var(--body);
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--paper);
+  background: var(--ink);
+  border: 1px solid var(--ink);
+  border-radius: 2px;
+  padding: 8px 13px;
+  cursor: pointer;
+  transition: background .18s, color .18s, transform .18s;
+}
+
+.act:hover { background: var(--kube); border-color: var(--kube); }
+.act:active { transform: translateY(1px); }
+.act[disabled] { opacity: .4; cursor: default; transform: none; background: var(--ink); }
+
+#c-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 16px;
+  padding-top: 13px;
+  border-top: 1px solid var(--paper-2);
+}
+
+#c-legend:empty { display: none; }
+
+.leg {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--data);
+  font-size: 10.5px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: #43586D;
+}
+
+.leg i {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  flex: none;
+}
+
+/* ── Voyage line (chapter nav) ────────────────────────────────────── */
+
+#voyage {
+  position: fixed;
+  left: 50%;
+  bottom: clamp(14px, 2.4vh, 26px);
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  background: rgba(11, 26, 43, .8);
+  border: 1px solid rgba(242, 237, 227, .14);
+  border-radius: 40px;
+  backdrop-filter: blur(8px);
+}
+
+#ports {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 0 4px;
+  padding: 0;
+  list-style: none;
+}
+
+.port {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+}
+
+/* the line between ports */
+.port::before {
+  content: "";
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  height: 1px;
+  background: rgba(242, 237, 227, .18);
+}
+
+.port:first-child::before { left: 50%; }
+.port:last-child::before { right: 50%; }
+
+.port i {
+  position: relative;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dim);
+  transition: background .2s, transform .2s;
+}
+
+.port:hover i { background: var(--paper); transform: scale(1.3); }
+.port.is-done i { background: var(--kube); }
+.port.is-now i { background: var(--signal); transform: scale(1.7); }
+
+.port span {
+  position: absolute;
+  bottom: 30px;
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  font-family: var(--data);
+  font-size: 10px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--paper);
+  background: var(--ink-2);
+  border: 1px solid rgba(242, 237, 227, .16);
+  border-radius: 2px;
+  padding: 4px 7px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .15s;
+}
+
+.port:hover span, .port:focus-visible span { opacity: 1; }
+
+.nav-btn {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  font-family: var(--body);
+  font-size: 15px;
+  line-height: 1;
+  color: var(--paper);
+  background: none;
+  border: 1px solid rgba(242, 237, 227, .2);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: background .18s, color .18s;
+}
+
+.nav-btn:hover { background: var(--paper); color: var(--ink); }
+
+/* The pause control is the one people look for, so it gets a word. */
+#play {
+  width: auto;
+  gap: 7px;
+  padding: 0 13px 0 11px;
+  border-radius: 14px;
+  font-size: 12px;
+  font-weight: 600;
+  grid-auto-flow: column;
+}
+
+#play i {
+  font-style: normal;
+  font-size: 9px;
+  letter-spacing: -1px;
+}
+
+#play.is-paused {
+  color: var(--ink);
+  background: var(--signal);
+  border-color: var(--signal);
+}
+
+#play.is-paused:hover { background: var(--paper); }
+
+/* ── Small furniture ──────────────────────────────────────────────── */
+
+#recenter {
+  position: fixed;
+  right: clamp(16px, 2vw, 30px);
+  bottom: clamp(14px, 2.4vh, 26px);
+  z-index: 5;
+  width: 34px;
+  height: 34px;
+  font-size: 16px;
+  color: var(--paper);
+  background: rgba(11, 26, 43, .8);
+  border: 1px solid rgba(242, 237, 227, .16);
+  border-radius: 50%;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+}
+
+#recenter:hover { background: var(--paper); color: var(--ink); }
+
+#hint {
+  position: fixed;
+  left: clamp(16px, 2vw, 30px);
+  bottom: clamp(14px, 2.4vh, 26px);
+  z-index: 4;
+  font-family: var(--data);
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  transition: opacity .6s;
+}
+
+#hint b {
+  font-weight: 400;
+  color: var(--paper-3);
+}
+
+:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+}
+
+/* ── Responsive ───────────────────────────────────────────────────── */
+
+@media (max-width: 900px) {
+  :root { --card-w: min(92vw, 460px); }
+
+  .gate-keys { grid-template-columns: 1fr; }
+  .gate-keys dt { padding-bottom: 0; border-bottom: 0; }
+  .gate-keys dd { padding-left: 0; }
+
+  #card {
+    top: auto;
+    bottom: 72px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-height: 44vh;
+  }
+
+  #ledger {
+    width: 148px;
+    padding: 9px 11px;
+  }
+
+  #mast h1 { font-size: 17px; }
+  #mast .mark { width: 30px; height: 30px; font-size: 17px; }
+
+  /* twelve chapters will not fit at full size on a phone */
+  .port { width: 17px; height: 22px; }
+  .port i { width: 6px; height: 6px; }
+  #voyage { gap: 3px; padding: 6px 8px; }
+  #ports { gap: 0; margin: 0 2px; }
+  .nav-btn { width: 26px; height: 26px; }
+  #play { width: auto; padding: 0 9px; }
+  #play span { display: none; }
+
+  .led-foot { display: none; }
+  .led-val { font-size: 24px; }
+  #mast p { display: none; }
+  #hint, #recenter { display: none; }
+  #voyage { bottom: 12px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .led-bar i, .act, .port i { transition: none; }
+}

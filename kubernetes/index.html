@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kubernetes, in 3D — what a cluster actually does</title>
+<meta name="description" content="An interactive 3D walkthrough of Kubernetes: the control plane, pods, the scheduler, the control loop, self-healing, services, scaling and rolling updates.">
+<link rel="stylesheet" href="vendor/fonts/fonts.css">
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>☸</text></svg>">
+<script type="importmap">
+{ "imports": {
+    "three": "./vendor/three/build/three.module.js",
+    "three/addons/": "./vendor/three/addons/"
+} }
+</script>
+</head>
+<body>
+
+<div id="chapbar"><i></i></div>
+<div id="stage"></div>
+<div id="labels"></div>
+
+<header id="mast">
+  <div class="mark">☸</div>
+  <div class="mark-text">
+    <h1>Kubernetes</h1>
+    <p>what a cluster actually does</p>
+  </div>
+</header>
+
+<!-- The signature element: the plan vs. reality ledger. Always on screen. -->
+<aside id="ledger" aria-live="polite">
+  <div class="led-head">reconcile ledger</div>
+  <div class="led-row">
+    <span class="led-key">desired</span>
+    <span class="led-val" id="led-desired">0</span>
+  </div>
+  <div class="led-row">
+    <span class="led-key">actual</span>
+    <span class="led-val" id="led-actual">0</span>
+  </div>
+  <div class="led-gap">
+    <div class="led-bar"><i id="led-fill"></i></div>
+    <div class="led-state" id="led-state">idle</div>
+  </div>
+  <p class="led-foot">The gap between these two numbers is the only thing Kubernetes is trying to close.</p>
+</aside>
+
+<!-- First thing you see: what this is, and how to drive it. -->
+<div id="gate">
+  <div class="gate-card">
+    <p class="gate-eyebrow">12 chapters · about 5 minutes</p>
+    <h2 class="gate-title">What a Kubernetes cluster actually does</h2>
+    <p class="gate-body">You write down what you want. A loop makes it true. That is the whole idea, and this walks through it in 3D — from four bare machines, to a node dying at 3am, to shipping a new version without going dark.</p>
+    <button id="gate-go" class="gate-btn">Start the walkthrough</button>
+    <a class="gate-alt" href="deep.html">or read the deep dive: The Control Plane, Deeply →</a>
+    <dl class="gate-keys">
+      <dt>plays itself</dt><dd>Chapters advance on their own. <kbd>space</kbd> pauses, <kbd>&larr;</kbd> <kbd>&rarr;</kbd> step, and the dots along the bottom jump anywhere.</dd>
+      <dt>you can look</dt><dd>Drag to orbit the cluster, scroll to zoom, <kbd>R</kbd> to put the camera back.</dd>
+      <dt>you can break it</dt><dd>Three chapters hand you the controls — kill a node, scale up, ship v2 — and you watch the cluster fix itself.</dd>
+    </dl>
+  </div>
+</div>
+
+<section id="card">
+  <div class="card-top">
+    <span class="chip" id="c-num">01</span>
+    <span class="kicker" id="c-kicker"></span>
+  </div>
+  <h2 id="c-title"></h2>
+  <p id="c-body"></p>
+  <ul id="c-list"></ul>
+  <div id="c-actions"></div>
+  <div id="c-legend"></div>
+</section>
+
+<nav id="voyage" aria-label="Chapters">
+  <button class="nav-btn" id="prev" title="Previous (←)" aria-label="Previous chapter">‹</button>
+  <button class="nav-btn" id="play" title="Play / pause (space)" aria-label="Play or pause"><i>❚❚</i><span>Pause</span></button>
+  <ol id="ports"></ol>
+  <button class="nav-btn" id="next" title="Next (→)" aria-label="Next chapter">›</button>
+</nav>
+
+<button id="recenter" title="Re-centre camera (R)" aria-label="Re-centre camera">⌖</button>
+<div id="hint">drag to orbit · scroll to zoom · ← → chapters</div>
+
+<noscript><p style="padding:2rem;color:#F2EDE3;font:16px system-ui">This walkthrough needs JavaScript.</p></noscript>
+<script type="module" src="src/main.js"></script>
+</body>
+</html>

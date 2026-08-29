@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Control Plane, Deeply — how Kubernetes actually works</title>
+<meta name="description" content="A written deep dive into Kubernetes control-plane internals — etcd and Raft, the API server pipeline, optimistic concurrency, informers, reconcile loops, the scheduler, the kubelet, leader election — with an animated figure for every section.">
+<link rel="stylesheet" href="vendor/fonts/fonts.css">
+<link rel="stylesheet" href="deep.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>☸</text></svg>">
+</head>
+<body>
+
+<div id="readbar"></div>
+
+<header id="topbar">
+  <div class="mark">☸</div>
+  <span class="t">Kubernetes</span>
+  <span class="sep">/</span>
+  <span class="t" style="color:var(--dim)">the control plane, deeply</span>
+  <nav><a href="index.html">3D walkthrough →</a></nav>
+</header>
+
+<section id="hero">
+  <p class="eyebrow">kubernetes · part two · the internals</p>
+  <h1>The Control Plane, Deeply</h1>
+  <div class="lede">
+    <p>You have seen the loop close the gap — desired on one side, actual on the other, a controller squeezing the difference to zero. This is the same machine, opened up: how the ledger agrees with itself, how writes race without locks, how one watch stream replaces a million polls, and why a component you <code>kill&nbsp;-9</code> at 3am owes nobody an apology.</p>
+    <p>Each section opens with a few lines of setup, then an animated figure does the real teaching — watch it, replay it, then read the short mechanics underneath to lock in the names and numbers. The <i>in&nbsp;practice</i> blocks show the real YAML where these ideas surface, and every section ends with the pattern worth stealing for systems that have nothing to do with containers.</p>
+  </div>
+  <div class="meta">
+    <span>14 sections</span><span>~20 min · figures do the teaching</span><span>every figure replayable</span><span><a href="index.html">start with the 3D walkthrough ↩</a></span>
+  </div>
+</section>
+
+<div id="frame">
+  <nav id="toc" aria-label="Sections">
+    <div class="toc-head">sections</div>
+      <a href="#s-shape"><span class="n">01</span><span>One door, one ledger, many loops</span></a>
+      <a href="#s-etcd"><span class="n">02</span><span>etcd: one history, in order</span></a>
+      <a href="#s-apiserver"><span class="n">03</span><span>A pipeline, not a brain</span></a>
+      <a href="#s-concurrency"><span class="n">04</span><span>No locks, only retries</span></a>
+      <a href="#s-watch"><span class="n">05</span><span>Watch, do not poll</span></a>
+      <a href="#s-reconcile"><span class="n">06</span><span>Levels, not edges</span></a>
+      <a href="#s-controllers"><span class="n">07</span><span>Controllers compose</span></a>
+      <a href="#s-scheduler"><span class="n">08</span><span>The scheduler: filter, score, bind</span></a>
+      <a href="#s-kubelet"><span class="n">09</span><span>The reconciler at the edge</span></a>
+      <a href="#s-leader"><span class="n">10</span><span>One driver at a time</span></a>
+      <a href="#s-network"><span class="n">11</span><span>The packet that never meets the Service</span></a>
+      <a href="#s-storage"><span class="n">12</span><span>Storage: a claim, not a disk</span></a>
+      <a href="#s-operators"><span class="n">13</span><span>Teach the ledger a new noun</span></a>
+      <a href="#s-lessons"><span class="n">14</span><span>What to Steal</span></a>
+  </nav>
+
+  <main>
+
+  <section class="sec" id="s-shape">
+    <p class="kicker"><span class="n">01</span> <span>the shape</span></p>
+    <h2>One door, one ledger, many loops</h2>
+    <div class="prose">
+      <p>Strip away the deployment diagrams and Kubernetes has one shape: a hub with spokes. At the hub sits the API server, a stateless HTTP server that exposes every object in the cluster — Pods (the unit of one or more running containers), Nodes (the machines they run on), and everything else — as REST resources. Behind it sits etcd, a replicated key-value store that holds the cluster's entire state.</p>
+      <p>The scheduler, the controller manager, the kubelet on every node, <code>kubectl</code>, your CI pipeline — each is an authenticated API client, no different in kind from a shell script calling <code>curl</code>. <b>Every other component in the system is a client of that one API, and nothing more.</b> Watch for the edges that never appear — and for what keeps working when components start dying.</p>
+    </div>
+    <figure class="fig" data-fig="shape">
+      <figcaption><b>fig 01</b> — Every component is a client of the API server. Watch the traffic, the forbidden shortcut, and what happens when one loop dies.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>By design, etcd accepts connections from exactly one client: the API server. That single door is where authentication, authorization, and audit logging happen — once, identically, whether the caller is a kubelet or an intern's laptop. The failure mode this kills is the one most systems accrete: a dozen components holding their own database credentials, each enforcing its own idea of validation, none producing a coherent audit trail.</p>
+      <p>The control-plane spokes hold no durable state of their own: a controller's in-memory cache is built by listing objects from the API and then watching for changes — no local database to corrupt, no snapshot to restore. <b>If losing a control-plane component's disk loses information, the design is broken.</b> That statelessness is what makes the control plane crash-only: Kubernetes does not lean on graceful shutdown, because a shutdown protocol only protects you when processes exit politely, and the outage you care about is the one where they don't. The crash path and the clean-exit path are the same path, so the recovery code runs on every restart instead of rotting until the incident that needed it.</p>
+      <p>The dark hub divides control plane — the components that decide — from data plane, the nodes where your containers execute. Containers survive because kubelets keep supervising them locally and traffic keeps flowing along routes already programmed into each node; what stops is change — no new rollouts, no rescheduling off a dead node, no scaling. <b>You lose the ability to change things, not the things themselves.</b> Debugging means querying one API: desired state and reported actual state sit side by side, inspectable with <code>kubectl get</code>, because there is nowhere else for shared state to live; and because the API is the only contract components share, each is independently replaceable — swap the stock scheduler for your own.</p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>Newcomers picture an RPC pipeline: kubectl calls the API server, which calls the scheduler, which calls the kubelet, each command flowing forward until the container starts.</p></div>
+      <div><span class="tag">what actually happens</span><p>No component calls another. Each writes records into the shared store through the API server and independently watches for records that concern it — a Pod starts because several watchers each reacted to state, not because anyone issued a command.</p></div>
+    </aside>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>Put one gateway in front of one authoritative store, and make every other component a stateless, crash-restartable client that rebuilds its world from that store on startup. Components then coordinate by writing records that others observe — coordination becomes data, which makes it auditable, replayable, and inspectable in ways an RPC chain never is.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-etcd">
+    <p class="kicker"><span class="n">02</span> <span>the source of truth</span></p>
+    <h2>etcd: one history, in order</h2>
+    <div class="prose">
+      <p>Everything the control plane knows — every Pod, every piece of configuration — lives in etcd, a replicated key-value store. Keep that store on one machine and the machine is a single point of failure for the entire cluster. Replicate it naively — two copies, both accepting writes — and a network partition produces split-brain: two divergent histories that no merge can honestly reconcile. <b>The problem consensus solves is not durability; it is agreement — after any failure, exactly one history survives.</b></p>
+      <p>Watch what a write must earn to count as committed, how the cluster outlives its leader yet freezes when split evenly, and why every key grows a stack of versions under one climbing counter instead of overwriting. That stack looks wasteful; the entire control plane is built on it.</p>
+    </div>
+    <figure class="fig" data-fig="etcd">
+      <figcaption><b>fig 02</b> — A write becomes true when a majority of etcd members have it in their log. Then the leader dies, and it barely matters.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>The protocol is Raft, built around one replicated, append-only log: every write flows through the leader and commits only once a majority — a quorum — has persisted it. Followers wait out an election timeout of roughly a second before electing a replacement under a fresh <i>term</i> — a monotonically increasing epoch number. What stops a revived old leader is quorum overlap: any majority it would need to commit overlaps the majority that elected its successor, those members reject its stale term, and it steps down on seeing the higher one.</p>
+      <p>Quorum arithmetic decides sizing: a majority of 3 is 2, of 5 is 3, of 4 also 3 — a fourth member buys nothing but replication traffic and another machine that can fail. Production control planes run 3 or 5, never 4; when quorum is lost entirely, etcd refuses writes rather than guess — <b>unavailable beats divergent</b>. The version stacks are MVCC: every write, to any key, increments one global <i>revision</i> — a logical clock, no wall clocks, no clock-skew arguments — surfaced to clients as <code>resourceVersion</code>, opaque by contract: something you hand back, never a number you parse or compare.</p>
+      <p>Keeping every version forever would grow etcd without bound, so it compacts, and a watcher that fell too far behind gets HTTP <code>410 Gone</code>: it must re-read current state and watch from there. Resynchronization is a designed-for event, not an emergency. Only the API server talks to etcd — partly policy (section 03), partly load: a large cluster runs tens of thousands of watchers, and a store paying a round of consensus per write cannot also serve them all, so the API server's watch cache serves nearly all watches and much of the read traffic. <b>Consensus is paid once per write and amortized across every reader.</b></p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>etcd is where Kubernetes keeps its data — a database that cluster components query and update the way an application talks to Postgres.</p></div>
+      <div><span class="tag">what actually happens</span><p>Only the API server ever touches etcd, and most reads never reach it at all. What etcd actually provides is ordering: one agreed-upon history of changes with positions you can subscribe from — the key-value storage is almost incidental.</p></div>
+    </aside>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>Pay for consensus exactly once, at a single replicated log that stamps every change with a global monotonic version, and make everything else a disposable subscriber that resumes from a version — or re-reads and re-subscribes when it falls too far behind. The product is order, not storage: a change feed with exact positions turns caching, replication, and crash recovery into the same operation.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-apiserver">
+    <p class="kicker"><span class="n">03</span> <span>the request pipeline</span></p>
+    <h2>A pipeline, not a brain</h2>
+    <div class="prose">
+      <p>Strip away the mythology and the Kubernetes API server (<code>kube-apiserver</code>) is a REST server in front of a key-value store. It does not schedule pods onto nodes, does not restart failed containers, does not compare desired state to actual state. <b>The API server is a validating, versioning storage gateway — every piece of cluster intelligence lives in its clients.</b></p>
+      <p>Then what earns a write the right to land in etcd? Follow one request — <code>kubectl apply</code> (the CLI submitting a manifest) creating a Deployment — and watch who may change the object, who may only refuse it, and whether anything can still touch it after a check has passed.</p>
+    </div>
+    <figure class="fig" data-fig="apiserver">
+      <figcaption><b>fig 03</b> — Three requests walk the write path: one clean, one stopped by RBAC, one stopped by schema validation.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>Authentication — client TLS certificates, bearer tokens, or OIDC — produces a username plus groups and approves no action, so you can swap identity providers without touching a single access rule. RBAC grants verbs on resources — <code>get</code>, <code>create</code>, <code>patch</code> — but has no opinion about the <i>contents</i> of the object: a cheap identity-level check rejects illegitimate traffic before the server spends effort on the payload. Schema defaults were stamped in at decode, and mutating webhooks are external HTTP services you register. <b>The ordering is the security property: validation and policy always see the final object, so no mutation can slip in after a check has passed.</b></p>
+      <p>A group/version like <code>apps/v1</code> is a wire contract, not a storage format: the server converts every request through a hub version — each of <i>n</i> served versions needs one converter, not <i>n</i>² pairwise — and persists at exactly one storage version, which lets a cluster upgrade its API without a flag-day migration. The <code>/status</code> side door is a permission boundary: users write <code>spec</code> — intent — controllers write <code>status</code> — observation — and RBAC can grant each side only its half. <b>Without the split, a user could forge "this pod is healthy," and no rule could let a controller report observations without also letting it rewrite intent.</b></p>
+      <p>Because the pipeline contains no per-type logic, a new type is configuration, not code: post a CustomResourceDefinition (CRD) — a schema plus a group/version/kind name — and the API server starts serving the new resource, RBAC and watch streams included. <b>A CRD buys your custom type the entire machine for the price of a schema</b> — the mechanism behind the operator ecosystem. Every durable fact lives in etcd, so replicas run all active, no leader election. Components that make decisions must elect a leader to avoid dueling actors; a gateway that decides nothing has nothing to duel over.</p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>The API server is the brain of the cluster — it decides where pods run, notices failures, and drives the system toward the desired state.</p></div>
+      <div><span class="tag">what actually happens</span><p>It decides nothing about the cluster. It authenticates, authorizes, mutates, validates, versions, and stores; scheduling and reconciling are done by separate components that are ordinary clients of the same API you use.</p></div>
+    </aside>
+    <div class="practice">
+      <div class="ph"><span class="t">in practice</span><span class="f">rbac.yaml</span></div>
+      <pre><span class="c"># Who may do what — enforced at the one door, identically for every client.</span>
+<span class="k">apiVersion</span>: rbac.authorization.k8s.io/v1
+<span class="k">kind</span>: Role
+<span class="k">metadata</span>:
+  <span class="k">name</span>: deployer
+  <span class="k">namespace</span>: shop
+<span class="k">rules</span>:
+- <span class="k">apiGroups</span>: ["apps"]
+  <span class="k">resources</span>: ["deployments"]
+  <span class="k">verbs</span>: ["get", "list", "watch", "update", "patch"]   <span class="c"># no delete, no create</span>
+---
+<span class="k">apiVersion</span>: rbac.authorization.k8s.io/v1
+<span class="k">kind</span>: RoleBinding
+<span class="k">metadata</span>:
+  <span class="k">name</span>: ci-deploys
+  <span class="k">namespace</span>: shop
+<span class="k">subjects</span>:
+- <span class="k">kind</span>: ServiceAccount
+  <span class="k">name</span>: ci-bot
+  <span class="k">namespace</span>: shop
+<span class="k">roleRef</span>:
+  <span class="k">kind</span>: Role
+  <span class="k">name</span>: deployer
+  <span class="k">apiGroup</span>: rbac.authorization.k8s.io</pre>
+      <p class="pnote">A request from <code>ci-bot</code> outside these verbs and resources dies at the RBAC gate with <code>403</code> — before admission, before validation, before anything.</p>
+    </div>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>Keep the gateway dumb: put one generic, stateless authenticate-validate-version-store pipeline in front of your database and push all domain intelligence into clients of its public API. The gateway then scales by replication with no election, and new object types cost a schema instead of a code change.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-concurrency">
+    <p class="kicker"><span class="n">04</span> <span>optimistic concurrency</span></p>
+    <h2>No locks, only retries</h2>
+    <div class="prose">
+      <p>When dozens of controllers write to the same objects, the reflex is to serialize them — take a lock, mutate, release. But a distributed lock is a liability with a failure mode attached. The holder crashes mid-update and the lock stays held forever, so you add a TTL; now a holder stalled in a long GC pause has its lock expire while it still believes it owns it, so you add fencing tokens. <b>Each patch to pessimistic locking adds a new machine that can itself fail.</b></p>
+      <p>Kubernetes opts out of the entire ladder: no write to an object ever waits on a lock. So what referees dozens of concurrent writers — and what does one that dies mid-flight leave behind? Watch the version number stamped on every copy.</p>
+    </div>
+    <figure class="fig" data-fig="concurrency">
+      <figcaption><b>fig 04</b> — Two controllers race on one object. The loser gets a 409, re-reads, and both intents survive.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>The referee is <code>metadata.resourceVersion</code>: an opaque string — underneath, the etcd MVCC revision from section 02 — naming the write that produced your copy. A <code>PUT</code> carrying a stale version is rejected with <code>409 Conflict</code>: <b>the server never blocks a writer; it refuses stale ones.</b> This is compare-and-swap, lifted from a CPU instruction to an HTTP API. Client-go ships the re-GET-and-retry loop (<code>retry.RetryOnConflict</code>) because a 409 is not an error path but the ordinary cost of concurrency. A crashed writer leaves nothing to expire, fence, or clean up — the fact section 01's crash-only design rests on.</p>
+      <p>One counter is not enough: <code>resourceVersion</code> changes on <i>every</i> write — a status update, another controller's touch — so it cannot answer the question you have after <code>kubectl apply</code>: has the controller acted on <i>my</i> change yet? Hence the second counter: <code>metadata.generation</code>, incremented only when the <code>spec</code> changes, and <code>status.observedGeneration</code>, the generation the controller most recently processed. If the second lags the first, every status field describes your <i>previous</i> intent — a Deployment can report healthy moments after you pushed a broken image, and comparing these two numbers is how you avoid believing it.</p>
+      <p>The version check cannot referee field-level ownership, because the danger there is not staleness: a deploy pipeline re-applying its full manifest holds a fresh <code>resourceVersion</code>, and its write legally resets the <code>replicas</code> the autoscaler set — the classic read-modify-write clobber. Server-side apply instead records in <code>metadata.managedFields</code> which manager set which field; each writer submits only the fields it cares about, and the server merges, conflicting only when two managers claim the <i>same</i> field. <b>The unit of ownership drops from the object to the field, so co-ownership stops being a race.</b> Even leader election reintroduces no lock: a single active actor is chosen by CAS on a Lease object, which section 10 takes apart.</p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>A 409 Conflict means something went wrong — two components writing to the same object at once is a race that Kubernetes must be preventing with a lock somewhere.</p></div>
+      <div><span class="tag">what actually happens</span><p>There is no lock anywhere; concurrent writers losing races is the designed steady state. Well-behaved clients wrap writes in a re-GET-and-retry loop, and a background rate of 409s on a busy cluster is contention being resolved, not malfunction.</p></div>
+    </aside>
+    <div class="practice">
+      <div class="ph"><span class="t">in practice</span><span class="f">three answers to the same race</span></div>
+      <pre><span class="c"># A write that carries a resourceVersion meets the check head-on.</span>
+<span class="c"># Replace from a stale copy and the API answers:</span>
+kubectl replace -f web.yaml
+<span class="c">#   Error from server (Conflict): Operation cannot be fulfilled on</span>
+<span class="c">#   deployments.apps "web": the object has been modified; please</span>
+<span class="c">#   apply your changes to the latest version and try again   # HTTP 409</span>
+
+<span class="c"># The declarative path sidesteps it: apply computes a three-way merge</span>
+<span class="c"># (your file, the live object, the last-applied record) and sends a</span>
+<span class="c"># PATCH with no resourceVersion — no version check to trip:</span>
+kubectl apply -f web.yaml
+
+<span class="c"># Server-side apply: field-level ownership. Two managers writing the</span>
+<span class="c"># same field get an explicit conflict instead of a silent clobber:</span>
+kubectl apply --server-side --field-manager=ci -f web.yaml
+<span class="c">#   error: Apply failed with 1 conflict: conflict with</span>
+<span class="c">#   "kubectl-client-side-apply" using apps/v1: .spec.replicas</span>
+<span class="c">#   (yield the field, or take it with --force-conflicts)</span></pre>
+      <p class="pnote">Controllers hit that 409 constantly and wrap writes in a re-GET-and-retry loop. <code>kubectl apply</code> avoids the race by patching instead; server-side apply turns it into an explicit field-ownership conflict. Same race, three answers.</p>
+    </div>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>Version every record and make every write conditional on the version the writer read; reject stale writes with a retryable error instead of making writers wait. Any number of writers can then coordinate without a lock service, and a writer that crashes mid-operation leaves nothing to expire, fence, or clean up.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-watch">
+    <p class="kicker"><span class="n">05</span> <span>the read path</span></p>
+    <h2>Watch, do not poll</h2>
+    <div class="prose">
+      <p>Start with the arithmetic. A production cluster holds tens of thousands of objects — Pods, Services, ConfigMaps, EndpointSlices — and dozens of control loops each need to notice when any of them changes. Poll once a second from every loop and that is hundreds of thousands of object reads per second pressed against a store that replicates through a Raft quorum — and polling has no good frequency: poll fast and you melt etcd, poll slow and every reaction waits out the interval.</p>
+      <p><b>Polling charges you for reads whether or not anything changed; a watch makes cost proportional to the rate of change.</b> Kubernetes buys that trade with a two-step contract, list+watch: watch the version stamp on the snapshot, and what it lets the client do when the stream breaks.</p>
+    </div>
+    <figure class="fig" data-fig="watch">
+      <figcaption><b>fig 05</b> — LIST builds the local replica, WATCH keeps it current, a dropped stream resumes by version, and resync re-verifies everything.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>The snapshot's stamp, <code>resourceVersion</code>, is the etcd revision counter — a cluster-wide logical clock. <b>A consistent snapshot plus an ordered, gap-free stream of deltas is a replication protocol: the client maintains a perfect local replica for the cost of one open HTTP connection.</b> Drop either guarantee and the replica silently corrupts. The <code>410 Gone</code> arrives when the server has already compacted the requested history away; relists are the expensive path, so the server periodically sends bookmark events — an otherwise-empty object carrying only the current <code>resourceVersion</code> — keeping even a watcher on a quiet resource from falling far behind.</p>
+      <p><code>client-go</code> packages this loop: its reflector feeds a <code>DeltaFIFO</code> keyed by object — all pending changes to one object accumulate under a single key and pop together — and the informer's cache is indexed by namespace, by name, by any index you register. Informers are shared: <code>kube-controller-manager</code> hosts dozens of loops, yet a shared informer opens one watch stream per resource type per process. <b>The API server is consulted on writes and once per type for the stream — never per decision.</b> Without sharing, connections would scale as controllers times types; with it, a controller's read costs a map lookup.</p>
+      <p>Handlers only extract a <code>namespace/name</code> key and enqueue it — nothing else. Each subscriber's handlers run in order on one dispatch goroutine, so a handler that blocks on I/O stalls every later event bound for that subscriber while the undelivered backlog piles up in memory. Ten rapid updates to one object collapse into one queued key. And the resync fires on a configurable interval — minutes or hours, not seconds — because edge-triggered systems die by dropped edges: a handler bug, a crash between dequeue and action, a delta mishandled once. <b>Re-presenting the full cached state on a clock means a missed event costs latency, never correctness.</b></p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>Controllers query the API server whenever they need an object's current state, so every reconciliation decision costs a round trip to the control plane.</p></div>
+      <div><span class="tag">what actually happens</span><p>Controllers read from a local in-memory cache kept current by one shared watch stream per resource type. The API server sits on the write path and the stream path — never on the per-decision read path.</p></div>
+    </aside>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>When many consumers must react to changes in shared state, do not let them poll the store. Hand each one a consistent snapshot stamped with a version, then an ordered, gap-free stream of deltas from that version: each consumer maintains a local replica and serves its own reads, so the source of truth pays one stream per consumer instead of one query per decision.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-reconcile">
+    <p class="kicker"><span class="n">06</span> <span>the reconcile loop</span></p>
+    <h2>Levels, not edges</h2>
+    <div class="prose">
+      <p>There are two ways to make a system respond to change. An <i>edge-triggered</i> system reacts to each change notification as it arrives — the notification is the work; a <i>level-triggered</i> system compares the full desired state against the full actual state and corrects the difference. The distinction sounds academic until a process crashes in the gap between receiving an event and acting on it. <b>An edge-triggered system that misses one edge drifts permanently; a level-triggered system converges from any starting state.</b> The lost event never gets redelivered; the next comparison happens regardless.</p>
+      <p>Kubernetes controllers are level-triggered: watch events still arrive, but they are demoted to hints about <i>when</i> to look, never inputs to <i>what</i> to do. In the figure, watch what reaches the worker — and what never does.</p>
+    </div>
+    <figure class="fig" data-fig="reconcile">
+      <figcaption><b>fig 06</b> — Three events collapse to one key; the key rides the loop; a failed act is requeued with backoff and retried from zero.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>A reconcile function receives one argument: a key, a <code>namespace/name</code> string such as <code>payments/api</code>, not the event that woke it, not a diff. <b>Because the function cannot know what changed, it is forced to re-observe everything</b>: desired state from the informer cache (the local, watch-maintained copy of the API server's data) and actual state. Miss an event and you lose freshness until the next hint or periodic resync; you never lose correctness.</p>
+      <p>The <i>workqueue</i>'s collapse is only safe because the queue item carries no payload: reconcile re-reads the entire current state, so under an update storm work stays bounded by the number of objects, not the number of events. The same key never goes to two workers at once, so two reconciles of one object cannot race into creating duplicate children. And backoff is per-key, starting at milliseconds and capping near the scale of minutes, so one persistently failing object backs off alone, without hammering the API server or starving healthy keys.</p>
+      <p>Idempotency is not a virtue here; it is a load-bearing requirement. Any reconcile may run twice (a resync, a duplicate hint, a crash after acting but before the key was marked done), so creating a child that already exists must degrade to a no-op, treating <code>409 AlreadyExists</code> as success, and deleting one already gone must swallow the <code>404</code>. A controller never trusts its own writes: the write may have failed, been mutated by an admission webhook, or been reverted seconds later; the next loop observes reality again. <b>A crash mid-reconcile loses no progress, because no progress is stored — only state is.</b> The system refuses to depend on exactly-once event delivery (a guarantee distributed systems cannot cheaply give) and pays in redundant reads served from a local cache; Kubernetes buys correctness with the cheaper currency.</p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>Controllers process the event stream — each watch event describes a change, the controller applies that change, and so the event log is effectively the source of truth.</p></div>
+      <div><span class="tag">what actually happens</span><p>Events never reach the reconcile function; only an object's key does. The controller re-reads full desired and actual state on every pass, so a lost or duplicated event costs a little latency, never correctness.</p></div>
+    </aside>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>Never let correctness depend on delivering every event: store desired state durably, make workers pure functions of a key that re-observe full state and converge, and treat notifications only as cache-invalidation hints that say "look now." You trade cheap redundant reads for immunity to lost messages, duplicate delivery, and mid-action crashes.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-controllers">
+    <p class="kicker"><span class="n">07</span> <span>the controller stack</span></p>
+    <h2>Controllers compose</h2>
+    <div class="prose">
+      <p>You run an application by creating a Deployment: an object holding a pod template, a replica count, and an update strategy. Pods must appear, roll over to a new image, and vanish when you delete — so the natural picture is one orchestrator that understands the whole plan, from your intent down to individual containers. <b>The Deployment controller never creates a pod.</b></p>
+      <p>As the figure runs, watch how far each controller reaches — what it creates, and what it never touches — and notice that no loop ever calls or messages another. Then hold one question: midway through a rolling update, where does the rollout's progress live, and what happens if its controller dies right then?</p>
+    </div>
+    <figure class="fig" data-fig="controllers">
+      <figcaption><b>fig 07</b> — A rollout as it actually is — two ReplicaSets and arithmetic — then a cascading delete walked by the garbage collector.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>A ReplicaSet's entire specification amounts to "keep <code>N</code> pods matching this template alive"; its controller counts the pods it owns that match its label selector — a rolling update, a revision, a rollback: that vocabulary does not exist at its layer. The opposed counters you watched are bounded by <code>maxSurge</code>, capping total pods above the desired count, and <code>maxUnavailable</code>, bounding available pods below it. <b>The replica counts of the two ReplicaSets are the entire state of the rollout.</b> A workflow engine that dies mid-sequence leaves you asking whether step four executed; kill this controller mid-update and its replacement reads two integers and resumes, because there are no steps — only a gap between two numbers.</p>
+      <p>Rollback is the same arithmetic: a bounded number of old ReplicaSets are kept at zero replicas as revision history, and restoring a template scales one back up through the identical code path as rollout — exactly as well-tested as the thing it undoes. Deletion composes through data: each child names its parent in <code>metadata.ownerReferences</code>, and the garbage collector — one more controller, maintaining a graph of who owns whom — deletes anything whose owner no longer exists. A parent that must clean up its own descendants can crash halfway and leak the rest; here the deletion intent lives in the data, where any later pass will find it.</p>
+      <p><code>kube-controller-manager</code> hosts dozens of these loops in one binary; each maintains one invariant it can state in a sentence, and they share informer caches but no logic and no private channels — a bug in the Job loop can mangle Jobs while rollouts keep working. The seams are public: an operator is a custom controller encoding operational knowledge, riding the same watches and conflict-checked writes — and <b>the control plane cannot tell your controller from its own</b>.</p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>The Deployment controller is an end-to-end orchestrator: it creates pods, watches them come up, and executes a scripted sequence of rollout steps.</p></div>
+      <div><span class="tag">what actually happens</span><p>It only writes ReplicaSet objects — pods are two layers away — and no component holds the rollout as a plan. The rollout's only state is the replica counts of two ReplicaSets, which is why a controller crash mid-update loses nothing.</p></div>
+    </aside>
+    <div class="practice">
+      <div class="ph"><span class="t">in practice</span><span class="f">deployment.yaml</span></div>
+      <pre><span class="k">apiVersion</span>: apps/v1
+<span class="k">kind</span>: Deployment
+<span class="k">metadata</span>:
+  <span class="k">name</span>: web
+  <span class="k">namespace</span>: shop
+<span class="k">spec</span>:
+  <span class="k">replicas</span>: <span class="hi">3</span>                     <span class="c"># desired state — remove once an HPA owns scaling (last section)</span>
+  <span class="k">revisionHistoryLimit</span>: 5          <span class="c"># old ReplicaSets kept around for rollback</span>
+  <span class="k">strategy</span>:
+    <span class="k">type</span>: RollingUpdate
+    <span class="k">rollingUpdate</span>:
+      <span class="k">maxSurge</span>: <span class="hi">1</span>                 <span class="c"># one extra pod may exist mid-rollout</span>
+      <span class="k">maxUnavailable</span>: <span class="hi">0</span>           <span class="c"># never dip below 3 — real only once a readinessProbe gates "ready"</span>
+  <span class="k">selector</span>:
+    <span class="k">matchLabels</span>: { app: web }      <span class="c"># which pods this deployment owns</span>
+  <span class="k">template</span>:
+    <span class="k">metadata</span>:
+      <span class="k">labels</span>: { app: web }         <span class="c"># must match the selector above</span>
+    <span class="k">spec</span>:
+      <span class="k">containers</span>:
+      - <span class="k">name</span>: web
+        <span class="k">image</span>: <span class="hi">ghcr.io/acme/web:1.7.2</span>   <span class="c"># pin versions — :latest defeats rollback</span>
+        <span class="k">ports</span>:
+        - <span class="k">containerPort</span>: 8080</pre>
+      <p class="pnote">Change <code>image</code> and the Deployment controller cuts a new ReplicaSet; <code>kubectl rollout undo</code> points back at the old one, which was kept for exactly this.</p>
+    </div>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>Decompose orchestration into a stack of small reconcilers, each owning exactly one parent-child relationship and communicating only through shared declarative state, never through calls to each other. Cross-cutting concerns like cleanup become one more reconciler over the same state, and because the seams are public data, third parties can add layers you never anticipated.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-scheduler">
+    <p class="kicker"><span class="n">08</span> <span>placement is a write</span></p>
+    <h2>The scheduler: filter, score, bind</h2>
+    <div class="prose">
+      <p>The scheduler sounds like it should be the most privileged component in the system: it decides which node — which worker machine — runs each pod. Yet it has no privileged interface at all. <b>It is one more watch client, queueing every pod whose <code>spec.nodeName</code> is empty.</b> It holds no lock on the cluster and no channel to the nodes; its entire authority is RBAC permission to set one field. Stop it and bind a pod by hand — POST the same request yourself — and the cluster cannot tell the difference.</p>
+      <p>So how does a component that can touch nothing but one field place every pod in the cluster? Watch where the scheduler's one arrow ends — and what keeps running when the scheduler dies.</p>
+    </div>
+    <figure class="fig" data-fig="scheduler">
+      <figcaption><b>fig 08</b> — Filter removes the impossible nodes, score ranks the survivors, and binding turns out to be one write.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>Filter checks CPU and memory against the pod's declared <i>requests</i>, not live usage, so placement does not flap with load; a failed check is a hard constraint, no partial credit. Each score plugin returns a number per node — roughly zero to one hundred — multiplied by the plugin's weight and summed. <b>Keeping filter and score separate keeps “cannot” out of the cost function:</b> a single blended fitness score would let enough preference points outvote a hard constraint, and a pod would land somewhere it cannot run.</p>
+      <p>The bind is a POST of a <code>Binding</code> to the pod's <code>binding</code> subresource, setting <code>spec.nodeName</code>. Recording the decision instead of executing it means the record outlives the decider: if the scheduler crashes a millisecond after the write commits, nothing is lost and no handshake was left half-open. A scheduler that pushed launch commands over connections to nodes would have to answer what happens when a connection drops mid-command — Kubernetes never has to ask. Its only state is the ledger, so there is no journal to replay: <b>a dead scheduler costs you placement latency, nothing else.</b></p>
+      <p>When filtering leaves zero nodes, preemption weighs priority, assigned through a <code>PriorityClass</code>: victims get their graceful shutdown, and the choice recorded in <code>status.nominatedNodeName</code> is a hint, not a reservation — the re-run may choose differently. Without preemption, a cluster full of batch work would lock out a critical pod forever; priority means nothing if arrival order always wins. Filter and score are plugin points in the scheduling framework, alongside pre-filter, reserve, permit, and pre-bind; one binary can run several <i>profiles</i>, selected per pod with <code>spec.schedulerName</code>. Because binding is an ordinary authenticated write, a custom scheduler is any program that watches for unbound pods and POSTs bindings — a toy one fits in a couple hundred lines.</p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>The scheduler is the engine of the cluster: it starts containers on nodes, so if it dies, workloads die with it or at least cannot restart.</p></div>
+      <div><span class="tag">what actually happens</span><p>Its only output is writing spec.nodeName on pending pods; each kubelet launches pods it discovers through its own watch. A dead scheduler leaves running pods untouched — new pods queue as Pending until it returns.</p></div>
+    </aside>
+    <div class="practice">
+      <div class="ph"><span class="t">in practice</span><span class="f">pod spec — placement inputs</span></div>
+      <pre>    <span class="k">spec</span>:
+      <span class="k">containers</span>:
+      - <span class="k">name</span>: web
+        <span class="k">image</span>: ghcr.io/acme/web:1.7.2
+        <span class="k">resources</span>:
+          <span class="k">requests</span>:                <span class="c"># what the SCHEDULER uses to place the pod</span>
+            <span class="k">cpu</span>: <span class="hi">250m</span>
+            <span class="k">memory</span>: <span class="hi">256Mi</span>
+          <span class="k">limits</span>:                  <span class="c"># what the KUBELET enforces at runtime</span>
+            <span class="k">memory</span>: 512Mi          <span class="c"># over this → OOMKilled. a cpu limit (unset here) throttles instead</span>
+      <span class="k">tolerations</span>:                 <span class="c"># permission to land on the node pool reserved for web</span>
+      - <span class="k">key</span>: dedicated
+        <span class="k">operator</span>: Equal
+        <span class="k">value</span>: web
+        <span class="k">effect</span>: NoSchedule
+      <span class="k">topologySpreadConstraints</span>:   <span class="c"># spread replicas across failure domains</span>
+      - <span class="k">maxSkew</span>: 1
+        <span class="k">topologyKey</span>: topology.kubernetes.io/zone
+        <span class="k">whenUnsatisfiable</span>: ScheduleAnyway
+        <span class="k">labelSelector</span>:
+          <span class="k">matchLabels</span>: { app: web }</pre>
+      <p class="pnote"><code>requests</code> are a promise the scheduler plans around; <code>limits</code> are a fence the kubelet enforces. Omit both and the scheduler places your pod blind — omit only requests and they quietly default to the limits.</p>
+    </div>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>Separate deciding from acting: have the decider publish its choice as a durable record in the shared store, and let executors discover and act on it through their own subscriptions. The decision then survives the decider's crash, the decider stays out of the data path, and any process with write access can replace or supplement it.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-kubelet">
+    <p class="kicker"><span class="n">09</span> <span>the loop at the edge</span></p>
+    <h2>The reconciler at the edge</h2>
+    <div class="prose">
+      <p>Every loop so far has run inside the control plane. The kubelet — one process per machine — ships that same shape to the edge: its desired state is the pod specs bound to its node, watched with a field selector on <code>spec.nodeName</code>; its actual state, the containers running on the machine beneath it. <b>The kubelet is a reconciler whose actuator is a container runtime instead of a REST API.</b></p>
+      <p>But the edge has a wake-up problem the control plane never had: containers die below Kubernetes, in the kernel and the runtime, and no API event announces it. Scheduling was a field write; nothing pushes commands to the node. Watch the arrows: what flows down, what flows up, and how a death the API never saw gets noticed.</p>
+    </div>
+    <figure class="fig" data-fig="kubelet">
+      <figcaption><b>fig 09</b> — The same loop at the edge: a bound pod arrives, containerd does the work, probes feed status, a crash is reconciled away.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>The kubelet speaks the Container Runtime Interface (CRI), a gRPC API implemented by a runtime such as containerd or CRI-O. It exists because the coupling it replaced was a failure mode — the kubelet once drove Docker through version-fragile glue code. <b>Kubernetes runs no containers anywhere; it is management all the way down.</b> The probe verdicts differ because restarting an overloaded server destroys its warm state and amplifies the overload; taking it out of rotation lets it recover. Restart the deadlocked, drain the busy — the exponential backoff between attempts is the <code>CrashLoopBackOff</code> you have seen.</p>
+      <p>The PLEG — pod lifecycle event generator — closes the gap: historically it relisted every container's state from the runtime roughly once a second; newer kubelets can subscribe to evented streams from the CRI, with a slower relist as backstop. Watch for speed, rescan for truth. Heartbeats get a tiny object — a Lease renewed roughly every ten seconds — because rewriting the large Node status every few seconds across a few thousand nodes is an etcd write storm; a renewal is a few hundred bytes. The node controller, a loop inside <code>kube-controller-manager</code>, watches for silence at <b>two timescales, because the two mistakes carry different prices: flagging a node through a network blip is cheap, but mass-evicting healthy pods is a self-inflicted outage.</b> Nothing detected a failure; a timestamp went stale.</p>
+      <p>The final beat resolves a circularity: the API server runs as a pod, but pods normally come from the API server. Static pods break it — the kubelet runs any pod spec it finds in a local manifest directory and reports read-only mirror pods upward; kubeadm writes the <code>etcd</code> and <code>kube-apiserver</code> manifests to disk. <b>The system hosts itself: the loop at the edge is the loop that boots the center.</b></p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>The control plane operates the nodes: the scheduler or a controller connects to each machine and instructs it to start and stop containers.</p></div>
+      <div><span class="tag">what actually happens</span><p>Nothing calls into a node. Scheduling is one field written to a pod record; the kubelet independently watches for pods bound to its node and drives the container runtime itself, so a node keeps its workloads converged even while the control plane is down.</p></div>
+    </aside>
+    <div class="practice">
+      <div class="ph"><span class="t">in practice</span><span class="f">probes — feeding the actual state</span></div>
+      <pre>      <span class="k">containers</span>:
+      - <span class="k">name</span>: web
+        <span class="k">image</span>: ghcr.io/acme/web:1.7.2
+        <span class="k">startupProbe</span>:              <span class="c"># gates the other probes until boot completes</span>
+          <span class="k">httpGet</span>: { path: /healthz, port: 8080 }
+          <span class="k">failureThreshold</span>: 30     <span class="c"># 30 × 2s — up to a minute of grace at boot</span>
+          <span class="k">periodSeconds</span>: 2
+        <span class="k">readinessProbe</span>:            <span class="c"># fail → removed from Service endpoints</span>
+          <span class="k">httpGet</span>: { path: <span class="hi">/ready</span>, port: 8080 }
+          <span class="k">periodSeconds</span>: 5
+          <span class="k">timeoutSeconds</span>: 3        <span class="c"># the 1s default times out on any GC pause</span>
+        <span class="k">livenessProbe</span>:             <span class="c"># fail → container restarted, with backoff</span>
+          <span class="k">httpGet</span>: { path: <span class="hi">/healthz</span>, port: 8080 }
+          <span class="k">periodSeconds</span>: 10
+          <span class="k">timeoutSeconds</span>: 3
+          <span class="k">failureThreshold</span>: 3      <span class="c"># three misses before the kubelet restarts it</span></pre>
+      <p class="pnote">Readiness gates traffic; liveness restarts. Point liveness at deadlock detection only — never at a dependency, or a flaky database restart-storms your whole fleet.</p>
+    </div>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>Ship the same reconciliation loop to your edge agents instead of commanding them: each agent watches the central store for its slice of desired state, actuates locally, and reports observations back through the same API — so the edge keeps converging even when the center is unreachable. Prove agent liveness with a small dedicated heartbeat record, separate from bulk status, so health signaling stays affordable at scale.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-leader">
+    <p class="kicker"><span class="n">10</span> <span>high availability</span></p>
+    <h2>One driver at a time</h2>
+    <div class="prose">
+      <p>Run the control plane on one machine and that machine is your cluster's single point of failure. The fix differs per component: stateless API servers replicate active-active, etcd commits on quorum — but replicate the scheduler or the controller-manager active-active and you have run the same loops twice against the same state. Two live controller-managers would each observe a ReplicaSet short one pod and each create one.</p>
+      <p><b>So these components run active-passive: several replicas, exactly one doing work</b> — which raises the question of who decides, and there is no coordination service to ask. As the figure plays, watch what leadership physically is, what a takeover costs while no one leads, and — the sharpest test — what happens when a leader that merely paused wakes up convinced it still leads.</p>
+    </div>
+    <figure class="fig" data-fig="leader">
+      <figcaption><b>fig 10</b> — Leader election with no election service: a lease renewed by CAS, drained by a crash, won by exactly one standby.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>The object being fought over is a <code>Lease</code>: an ordinary API object in the <code>coordination.k8s.io</code> group whose interesting fields are <code>holderIdentity</code>, <code>renewTime</code>, and <code>leaseDurationSeconds</code>. Acquiring it is a write like any other: read the Lease, check it is empty or expired, and write your identity into it — against the <code>resourceVersion</code> you read, the same optimistic-concurrency check that guards every other write. <b>Election is not a new mechanism — it is one more compare-and-swap, serialized by the same Raft log as everything else.</b> The failure mode avoided is a second consensus system to deploy, secure, upgrade, and page on alongside etcd.</p>
+      <p>The timings the figure compresses: the leader renews <code>renewTime</code> every couple of seconds, standbys re-read it on the same cadence, and after roughly fifteen seconds the lease is expired in every standby's eyes. The leaderless window costs nothing, because the loops are level-triggered: the new leader lists current state and finds every piece of pending work already in it. <b>Nothing sat queued in the dead leader's memory that a fresh list cannot reconstruct.</b></p>
+      <p>One caveat the coda only gestures at: a leader that pauses — a long GC pause, a frozen VM — rather than dies can wake after expiry still believing it leads, and act for a moment while its successor is already working. Lock-based systems need fencing tokens to survive this; Kubernetes absorbs it instead. Updates built from the stale leader's pre-pause view carry old <code>resourceVersion</code>s and land as <code>409</code>, and any duplicate it manages to create is surplus for the next idempotent reconcile to delete — the Lease exists to prevent duplicate work; safety lives in the CAS on each individual write. <b>Recovery is not a separate code path that runs rarely and rots; it is the reconcile loop, the code path that runs every second of every ordinary day.</b></p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>Newcomers assume Kubernetes runs a dedicated election or coordination service (something like ZooKeeper), and that holding the leader lock is what makes it safe when two processes think they lead.</p></div>
+      <div><span class="tag">what actually happens</span><p>There is no election service: leadership is an ordinary Lease object won by a CAS write through the API server, and safety comes from every write being CAS-guarded — a stale leader's updates from its outdated view die as 409s, whatever the lease says.</p></div>
+    </aside>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>If every write in your system already goes through compare-and-swap against a versioned store, leader election needs no lock service: model leadership as a plain record with a holder identity and an expiry, acquired and renewed with the same CAS as your data. Keep correctness in the per-write CAS rather than in the lease, so a paused-then-resumed stale leader produces conflicts and cleanable duplicates, not corruption.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-network">
+    <p class="kicker"><span class="n">11</span> <span>the data plane</span></p>
+    <h2>The packet that never meets the Service</h2>
+    <div class="prose">
+      <p>The walkthrough gave every Service a stable address: the pods behind <code>web.shop</code> churn while <code>10.96.0.12</code> holds still. The natural mental model is that something answers at that address — a load-balancer process accepting connections and forwarding them. Go looking for it and there is nothing to find. <b>No process anywhere listens on a ClusterIP.</b> No pod holds the address; it exists only as a row in the ledger and as rewrite rules on every node.</p>
+      <p>The naive design — a real box in the middle — costs what middleboxes always cost: an extra hop on every connection, a throughput ceiling, one more failure that takes all traffic with it. Watch the packet instead: where its destination changes, and what never touches it.</p>
+    </div>
+    <figure class="fig" data-fig="network">
+      <figcaption><b>fig 11</b> — A packet chases a virtual IP that no process listens on — rewritten by kernel rules, straight to a pod, and rerouted when a backend dies.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>The rewrite happens in the client node's kernel. <code>kube-proxy</code> runs on every node, but despite the name it proxies nothing: it is a controller that watches Services and EndpointSlices and compiles them into kernel rules — iptables chains or IPVS tables — that DNAT a packet's destination from the ClusterIP to a real pod IP as it leaves. eBPF dataplanes like Cilium can drop kube-proxy entirely and install the same logic as kernel programs. <b>Either way, no process sits in the data path.</b> The failure mode this kills is the middlebox: a hop that must scale with traffic and takes every flow down with it when it dies.</p>
+      <p>The set of legal rewrite targets is itself an object. The EndpointSlice controller watches pods and maintains, per Service, the list of backend IPs — each entry a target only while its pod passes its readiness probe, which is how the kubelet's probe verdicts reach routing: a pod failing readiness drops out of every node's rules without being restarted. When a backend dies, the update is pure ledger: the kubelet reports the pod gone, the EndpointSlice controller trims the list, and every node's kube-proxy sees the watch event and reprograms. <b>No node tells another node anything;</b> a thousand rule tables converge because all watch the same record.</p>
+      <p>Naming runs on the same machinery. CoreDNS resolves <code>web.shop.svc</code> to the ClusterIP — no privileged infrastructure, just a pod running a controller that watches Services and answers from cache. Ingress repeats this one layer up: an Ingress object is routing data in the ledger, and an ingress controller — an ordinary pod running nginx or envoy — watches those objects and rewrites its own configuration. <b>Watch-and-reconcile does not care whether it programs a kernel table, a DNS zone, or a reverse proxy.</b></p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>A Service is a load balancer — a process that receives your connection at the ClusterIP and forwards it to a pod, the way an nginx or HAProxy box would.</p></div>
+      <div><span class="tag">what actually happens</span><p>A Service is a row of data. Every node independently compiles that row into local kernel rewrite rules, so the packet is redirected to a pod IP in flight; nothing ever receives traffic at the ClusterIP itself.</p></div>
+    </aside>
+    <div class="practice">
+      <div class="ph"><span class="t">in practice</span><span class="f">ingress.yaml — L7, same pattern</span></div>
+      <pre><span class="c"># Inside the cluster, DNS + the VIP already work with zero config:</span>
+<span class="c">#   web.shop.svc.cluster.local → 10.96.0.12</span>
+<span class="c">#   (a virtual IP: no pod answers for it — every node's kernel rewrites it)</span>
+
+<span class="c"># For traffic from OUTSIDE, describe the route — as data:</span>
+<span class="k">apiVersion</span>: networking.k8s.io/v1
+<span class="k">kind</span>: Ingress
+<span class="k">metadata</span>:
+  <span class="k">name</span>: web
+  <span class="k">namespace</span>: shop
+  <span class="k">annotations</span>:
+    <span class="k">cert-manager.io/cluster-issuer</span>: letsencrypt   <span class="c"># TLS via yet another controller</span>
+<span class="k">spec</span>:
+  <span class="k">ingressClassName</span>: <span class="hi">nginx</span>          <span class="c"># which watching controller acts on this</span>
+  <span class="k">rules</span>:
+  - <span class="k">host</span>: shop.example.com
+    <span class="k">http</span>:
+      <span class="k">paths</span>:
+      - <span class="k">path</span>: /
+        <span class="k">pathType</span>: Prefix
+        <span class="k">backend</span>:
+          <span class="k">service</span>:
+            <span class="k">name</span>: web              <span class="c"># → the Service → the EndpointSlice → pods</span>
+            <span class="k">port</span>:
+              <span class="k">number</span>: 80
+  <span class="k">tls</span>:
+  - <span class="k">hosts</span>: [shop.example.com]
+    <span class="k">secretName</span>: shop-tls           <span class="c"># cert-manager's ACME flow fills this Secret</span></pre>
+      <p class="pnote">An Ingress does nothing by itself — it is a row in the ledger. The ingress controller watches it and reprograms itself. cert-manager spots the <code>cluster-issuer</code> annotation, creates a <code>Certificate</code> object from the <code>tls:</code> block, runs the ACME flow, and lands the key pair in <code>shop-tls</code> — controllers all the way down. One caveat: the Ingress API is feature-frozen and <code>ingress-nginx</code> was retired in early 2026 — on new clusters reach for the <b>Gateway API</b> (Gateway + HTTPRoute) or a maintained class (Cilium, Traefik, cloud-managed); the pattern is identical.</p>
+    </div>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>Route traffic with replicated configuration, not with a box in the middle: publish the mapping from virtual name to live backends as data in a shared store, and let every host watch it and compile it into local forwarding rules. The data path gains no hop and no new failure point, and hosts converge on new routes without ever talking to each other.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-storage">
+    <p class="kicker"><span class="n">12</span> <span>persistence as intent</span></p>
+    <h2>Storage: a claim, not a disk</h2>
+    <div class="prose">
+      <p>Everything the control plane has managed so far is disposable. A pod dies, the ReplicaSet stamps out an identical replacement, and nothing is lost — because nothing was kept. A database breaks that assumption: its data must outlive any pod, any node, and ideally the app team's knowledge of which cloud it runs on.</p>
+      <p>Kubernetes answers with the split it uses everywhere: <b>separate the request from the thing</b>. The app team writes a <code>PersistentVolumeClaim</code> — "10Gi, class <code>fast</code>" — and never names a disk. In the figure, watch which cards are still lit after the pod is gone: that is the durable half of the system.</p>
+    </div>
+    <figure class="fig" data-fig="storage">
+      <figcaption><b>fig 12</b> — A claim becomes a disk: the provisioner reconciles intent into hardware, the disk follows the pod to its node, and outlives it.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>A <code>PersistentVolumeClaim</code> is desired state: a size and a <code>storageClassName</code>, written by the app team. A <code>PersistentVolume</code> is the record of an actual disk, cloud volume ID included. Binding matches them — the same intent/observation split as <code>spec</code> and <code>status</code>, stretched across two objects. The StorageClass names an external provisioner, and that CSI controller is <b>another reconcile loop, running out-of-tree</b>: watch for unbound claims, call the cloud API, post a <code>PersistentVolume</code> back to the ledger.</p>
+      <p>CSI is storage's CRI: a gRPC contract — <code>CreateVolume</code>, <code>ControllerPublishVolume</code> to attach a disk to a node, <code>NodeStageVolume</code> and <code>NodePublishVolume</code> to mount it — onto the node once, then into each pod. Before CSI, vendor drivers lived in the Kubernetes tree, so a cloud SDK bug shipped inside core and waited for the next Kubernetes release to fix; the contract lets vendors patch on their own schedule. One problem remains: a disk provisioned before scheduling can land in a zone the pod never reaches. <code>volumeBindingMode: WaitForFirstConsumer</code> defers provisioning until the scheduler places the pod, so the disk is created where the pod runs — scheduler and storage negotiating through the ledger, never calling each other.</p>
+      <p>Delete the pod and the mount is released, but the claim, the volume, and the data stay — <b>the claim is the durable object</b>, and pods are temporary attachments to it. Deleting the claim is the real decision point: <code>reclaimPolicy</code> decides whether the underlying disk is destroyed (<code>Delete</code>) or kept — <code>PersistentVolume</code> and data intact — for manual recovery (<code>Retain</code>). StatefulSets close the loop for replicated databases: each pod gets a stable ordinal name — <code>pg-0</code>, <code>pg-1</code> — and a claim template keyed to that name, so a replacement <code>pg-1</code> re-finds <code>pg-1</code>'s claim instead of an empty disk.</p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>Storage belongs to the pod: mounting a volume ties the disk's lifetime to the container, so deleting the pod deletes the data — which is why databases don't belong on Kubernetes.</p></div>
+      <div><span class="tag">what actually happens</span><p>The pod mounts a claim, not a disk, and the claim's lifetime is independent of every pod that uses it. Data is at risk only when the claim itself is deleted, and even then <code>reclaimPolicy</code> decides whether the underlying volume survives.</p></div>
+    </aside>
+    <div class="practice">
+      <div class="ph"><span class="t">in practice</span><span class="f">statefulset storage — each replica its own claim</span></div>
+      <pre><span class="k">apiVersion</span>: storage.k8s.io/v1
+<span class="k">kind</span>: StorageClass
+<span class="k">metadata</span>:
+  <span class="k">name</span>: fast
+<span class="k">provisioner</span>: ebs.csi.aws.com       <span class="c"># a CSI driver — storage's CRI</span>
+<span class="k">parameters</span>:
+  <span class="k">type</span>: gp3
+<span class="k">volumeBindingMode</span>: <span class="hi">WaitForFirstConsumer</span>   <span class="c"># provision where the pod lands</span>
+<span class="k">allowVolumeExpansion</span>: true         <span class="c"># else the 10Gi is forever</span>
+<span class="k">reclaimPolicy</span>: <span class="hi">Retain</span>             <span class="c"># database class: deletion keeps the disk</span>
+---
+<span class="k">apiVersion</span>: apps/v1
+<span class="k">kind</span>: StatefulSet
+<span class="k">metadata</span>:
+  <span class="k">name</span>: pg
+  <span class="k">namespace</span>: shop
+<span class="k">spec</span>:
+  <span class="k">serviceName</span>: pg                  <span class="c"># headless Service providing pg-0.pg, pg-1.pg</span>
+  <span class="k">replicas</span>: 2
+  <span class="k">selector</span>:
+    <span class="k">matchLabels</span>: { app: pg }
+  <span class="k">template</span>:
+    <span class="k">metadata</span>:
+      <span class="k">labels</span>: { app: pg }
+    <span class="k">spec</span>:
+      <span class="k">containers</span>:
+      - <span class="k">name</span>: postgres
+        <span class="k">image</span>: postgres:16
+        <span class="k">env</span>:
+        - <span class="k">name</span>: PGDATA             <span class="c"># one level below the mount — a fresh ext4</span>
+          <span class="k">value</span>: <span class="hi">/var/lib/postgresql/data/pgdata</span>   <span class="c"># volume has lost+found at its root</span>
+        <span class="k">volumeMounts</span>:
+        - <span class="k">name</span>: data
+          <span class="k">mountPath</span>: /var/lib/postgresql/data
+  <span class="k">volumeClaimTemplates</span>:            <span class="c"># one claim PER REPLICA: data-pg-0, data-pg-1</span>
+  - <span class="k">metadata</span>:
+      <span class="k">name</span>: data
+    <span class="k">spec</span>:
+      <span class="k">accessModes</span>: [ReadWriteOnce] <span class="c"># one node at a time (ReadWriteOncePod: one pod)</span>
+      <span class="k">storageClassName</span>: fast
+      <span class="k">resources</span>:
+        <span class="k">requests</span>:
+          <span class="k">storage</span>: <span class="hi">10Gi</span></pre>
+      <p class="pnote"><code>volumeClaimTemplates</code> mint one claim per replica (<code>data-pg-0</code>, <code>data-pg-1</code>) so identity survives rescheduling — a single shared RWO claim would deadlock the second replica. <code>WaitForFirstConsumer</code> lets the scheduler pick the node first so the disk is born in the right zone. And <code>Retain</code> means deleting the claim — or the whole namespace — leaves the disk recoverable instead of gone.</p>
+    </div>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>Split resource acquisition into two records — a request stating requirements and a record of the thing actually built — and let a pluggable fulfiller match them asynchronously by watching for unmet requests. The request is the durable handle: consumers die and get replaced without losing the resource, and providers ship behind a fixed RPC contract on their own release cycle.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-operators">
+    <p class="kicker"><span class="n">13</span> <span>nothing is privileged</span></p>
+    <h2>Teach the ledger a new noun</h2>
+    <div class="prose">
+      <p>Every mechanism in this deep dive — the watch streams, the reconcile loops, the <code>ownerReferences</code>, the leases — has been serving Kubernetes' own types. So here is the question the whole architecture has been building toward: what does it take for the ledger to hold a noun Kubernetes has never heard of, like <code>PostgresCluster</code>?</p>
+      <p>In most platforms the answer is fork the core or bolt a second API alongside it, and the fork is where extensions go to rot. Watch for three things: a new type arriving as plain data, its endpoint live before anything restarts, and an ordinary pod running the same loop the built-ins run — handling a database failover with nobody paged.</p>
+    </div>
+    <figure class="fig" data-fig="operators">
+      <figcaption><b>fig 13</b> — A CRD teaches the API server a new noun; your controller gives it a janitor — and a 3am failover becomes a reconcile.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>A <code>CustomResourceDefinition</code> is itself an object you <code>POST</code> to the API server: the schema for a new type, expressed as data. Because the request pipeline contains no per-type logic — section 03's payoff — the server starts serving the type immediately: REST endpoints under <code>/apis/db.acme.io/v1/postgresclusters</code>, storage in etcd, RBAC verbs, watch streams, <code>kubectl</code> support, even the <code>spec</code>/<code>status</code> split once the CRD opts into the status subresource — with zero changes to Kubernetes code and no restart. The failure mode this kills is the fork: a core recompiled per type turns every extension into a patch you carry forever.</p>
+      <p>An operator is that CRD plus a controller you write, running the same informer, workqueue, and reconcile loop as the built-ins — <i>controller-runtime</i> and <i>kubebuilder</i> package client-go's machinery so you write little beyond the reconcile function. Your controller ships as an ordinary Deployment: a client like every other, entering through the same door, bound by the same RBAC. Seeing a <code>PostgresCluster</code>, it creates the StatefulSet, Services, and Secrets with <code>ownerReferences</code> pointing back, so deleting the parent lets garbage collection sweep the children. The point is to encode operational knowledge — provisioning, backup, upgrade, failover — as a loop over a domain object: when the primary dies, the reconciler promotes the replica, repoints the Service, and writes <code>status</code>, instead of a human working a runbook at 3am.</p>
+      <p>One honest caveat: an operator is software you now maintain, and a careless loop can fight the built-in controllers over the same children — so idempotency and level-triggered discipline matter more, not less. The meta-pattern is the capstone: <b>the extension mechanism is the core mechanism</b>. The Deployment controller uses no API your controller cannot; nothing the built-ins rely on is privileged, and that is the strongest evidence for the design — its authors chose to live inside it.</p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>Extending Kubernetes with a new resource type means writing a plugin the API server loads, or patching and redeploying the server — surely the server must contain code that understands each type it serves.</p></div>
+      <div><span class="tag">what actually happens</span><p>A CRD is one object you POST: a schema, stored as data, that the generic machinery serves immediately with no new server code. All behavior lives in your controller — an ordinary client pod with no special access.</p></div>
+    </aside>
+    <div class="practice">
+      <div class="ph"><span class="t">in practice</span><span class="f">crd.yaml — a new noun</span></div>
+      <pre><span class="k">apiVersion</span>: apiextensions.k8s.io/v1
+<span class="k">kind</span>: CustomResourceDefinition
+<span class="k">metadata</span>:
+  <span class="k">name</span>: postgresclusters.db.acme.io
+<span class="k">spec</span>:
+  <span class="k">group</span>: db.acme.io
+  <span class="k">scope</span>: Namespaced
+  <span class="k">names</span>:
+    <span class="k">kind</span>: PostgresCluster
+    <span class="k">plural</span>: postgresclusters
+    <span class="k">shortNames</span>: [pg]               <span class="c"># kubectl get pg</span>
+  <span class="k">versions</span>:
+  - <span class="k">name</span>: v1
+    <span class="k">served</span>: true
+    <span class="k">storage</span>: true
+    <span class="k">schema</span>:
+      <span class="k">openAPIV3Schema</span>:             <span class="c"># validation at the door, like any built-in</span>
+        <span class="k">type</span>: object
+        <span class="k">properties</span>:
+          <span class="k">spec</span>:
+            <span class="k">type</span>: object
+            <span class="k">properties</span>:
+              <span class="k">replicas</span>: { type: integer, minimum: 1 }
+              <span class="k">version</span>:  { type: string }
+          <span class="k">status</span>:
+            <span class="k">type</span>: object
+            <span class="k">properties</span>:
+              <span class="k">phase</span>: { type: string }
+    <span class="k">subresources</span>:
+      <span class="k">status</span>: {}                   <span class="c"># the spec/status split — for YOUR type, free</span>
+---
+<span class="c"># apply the CRD first, then:</span>
+<span class="c">#   kubectl wait --for=condition=Established crd/postgresclusters.db.acme.io</span>
+<span class="k">apiVersion</span>: db.acme.io/v1
+<span class="k">kind</span>: PostgresCluster
+<span class="k">metadata</span>:
+  <span class="k">name</span>: pg-main
+  <span class="k">namespace</span>: shop
+<span class="k">spec</span>:
+  <span class="k">replicas</span>: <span class="hi">2</span>
+  <span class="k">version</span>: "16"</pre>
+      <p class="pnote">Apply the CRD, wait for it to report <code>Established</code> (a second or two — applying CRD and instance in one shot is a classic race), and <code>kubectl get pg</code>, RBAC and watch streams all work. Because the status subresource is on, your controller's Role needs both <code>postgresclusters</code> and <code>postgresclusters/status</code>. The only code you write is the controller.</p>
+    </div>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>Build the core as a generic engine with no per-type logic, let new types register as data, and implement your own first-party features through the exact public machinery third parties use. The moment built-in code gets a private path, extensions become second-class and your public API stops being tested by the people who own it.</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-lessons">
+    <p class="kicker"><span class="n">14</span> <span>the portable core</span></p>
+    <h2>What to Steal</h2>
+    <div class="prose">
+      <p>Ten sections of mechanics are behind you; one question remains — what generalizes? Newcomers assume these patterns are inseparable from Kubernetes. <b>Each is a storage-and-loop design decision that predates and outlives it</b>: you can build a billing reconciler, a sync engine, or a provisioning system on all of them without running a single container.</p>
+      <p>The figure strips the nouns away and reruns the system as a ledger and its janitors. Watch what never has to happen: no loop hands work to another by calling it, no crash loses anything a restart cannot rebuild, and the machinery serving a brand-new row type is the machinery that served the first. The question it poses: what is the smallest set of decisions that buys all three?</p>
+    </div>
+    <figure class="fig" data-fig="lessons">
+      <figcaption><b>fig 14</b> — Nine patterns worth stealing, in one place.</figcaption>
+    </figure>
+    <div class="prose">
+      <p>"Three replicas" is safe to deliver twice, late, or out of order; "add one replica" is safe under none of those, because its meaning depends on state the sender only guessed at. So a billing reconciler stores the balance each account should be at, not charge events — <b>duplicated or reordered events corrupt a ledger, a stated target cannot</b>. A notification only says "look now," never carrying the work itself, which makes a missed event survivable — the fatal flaw of edge-triggered designs, where one dropped message leaves the system permanently wrong.</p>
+      <p>The bounced write is <code>409 Conflict</code> rejecting a stale <code>resourceVersion</code>: a lock holder that dies stalls everyone behind it until a lease expires; <b>a failed compare-and-swap costs one retry and blocks nobody</b>. Retries stay cheap because every repair runs twice safely — create-if-absent, delete-if-present, patch-toward-target; payment systems call it idempotency keys; provisioning systems should say "ensure the VM exists," never "create the VM." The janitors read from an in-memory cache fed by a change stream, since naive polling melts the store as clients multiply; when the stream breaks, the client re-lists to heal the cache, and a periodic resync re-queues what is already cached, bounding how long a skipped reconcile can last.</p>
+      <p>Many small loops, because a central orchestrator accumulates the cross-product of every workflow's states and becomes unmodifiable. Crash-only workers — outside the store itself, no durable state — because graceful-shutdown logic is the least-tested code in most systems, and exactly the code that runs during your worst outage. The new row type is a CRD (CustomResourceDefinition), granted the same storage, versioning, watches, access control, and admission checks as built-in types; run your own platform's features through it, because <b>the moment you keep a private, better API for yourself, the public one rots</b>.</p>
+    </div>
+    <aside class="wrong">
+      <div><span class="tag">the usual wrong model</span><p>Newcomers assume these patterns are inseparable from Kubernetes — that you get them by adopting the platform, and that outside container orchestration they do not apply.</p></div>
+      <div><span class="tag">what actually happens</span><p>Every pattern here is a storage-and-loop design decision that predates and outlives Kubernetes. You can build a billing reconciler, a sync engine, or a provisioning system on all nine without running a single container.</p></div>
+    </aside>
+    <div class="practice">
+      <div class="ph"><span class="t">in practice</span><span class="f">the rest of a production stack</span></div>
+      <pre><span class="k">apiVersion</span>: v1
+<span class="k">kind</span>: Service
+<span class="k">metadata</span>:
+  <span class="k">name</span>: web
+  <span class="k">namespace</span>: shop
+<span class="k">spec</span>:
+  <span class="k">selector</span>: { app: web }           <span class="c"># membership by label — pods come and go</span>
+  <span class="k">ports</span>:
+  - <span class="k">port</span>: 80
+    <span class="k">targetPort</span>: 8080
+---
+<span class="k">apiVersion</span>: autoscaling/v2
+<span class="k">kind</span>: HorizontalPodAutoscaler
+<span class="k">metadata</span>:
+  <span class="k">name</span>: web
+  <span class="k">namespace</span>: shop
+<span class="k">spec</span>:
+  <span class="k">scaleTargetRef</span>:
+    <span class="k">apiVersion</span>: apps/v1
+    <span class="k">kind</span>: Deployment
+    <span class="k">name</span>: web
+  <span class="k">minReplicas</span>: 3
+  <span class="k">maxReplicas</span>: 12
+  <span class="k">metrics</span>:
+  - <span class="k">type</span>: Resource
+    <span class="k">resource</span>:
+      <span class="k">name</span>: cpu                    <span class="c"># utilization = usage ÷ request, so cpu</span>
+      <span class="k">target</span>:                      <span class="c"># requests must be set on the pods</span>
+        <span class="k">type</span>: Utilization
+        <span class="k">averageUtilization</span>: <span class="hi">70</span>    <span class="c"># a controller now edits replicas for you</span>
+---
+<span class="k">apiVersion</span>: policy/v1
+<span class="k">kind</span>: PodDisruptionBudget
+<span class="k">metadata</span>:
+  <span class="k">name</span>: web
+  <span class="k">namespace</span>: shop
+<span class="k">spec</span>:
+  <span class="k">maxUnavailable</span>: <span class="hi">1</span>               <span class="c"># tracks the autoscaled count; a fixed</span>
+  <span class="k">selector</span>:                        <span class="c"># minAvailable goes stale as HPA scales</span>
+    <span class="k">matchLabels</span>: { app: web }</pre>
+      <p class="pnote">The HPA is one more controller editing your desired state — so delete <code>replicas:</code> from the Deployment manifest once it owns scaling, or every re-apply stomps the autoscaler. The PDB is a constraint other controllers must respect while they work. Every piece is the same machinery.</p>
+    </div>
+    <div class="pattern">
+      <div class="tag">the pattern to steal</div>
+      <p>When a system must keep reality matching a plan, store the plan as versioned data in one place and surround it with many small, idempotent, crash-only loops that continually converge reality toward it — coordinating through the record, never through messages between components.</p>
+    </div>
+  </section>
+  </main>
+</div>
+
+<footer id="foot">
+  <a href="index.html">↩ Back to the 3D walkthrough</a>
+  <div class="sub">watch the loop close the gap again — it will read differently now</div>
+</footer>
+
+<script type="module" src="src/deep/main.js"></script>
+</body>
+</html>

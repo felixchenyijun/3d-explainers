@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check /Users/felix/learn_ai/3js/llm-inference/machine.js)",
+      "Bash(node --check /Users/felix/learn_ai/3js/engine/inspect.js)",
+      "Bash(node -e ' *)",
+      "Bash(node --input-type=module --check)",
+      "Bash(node --input-type=module -e ' *)",
+      "Bash(node protein-synthesis/speech.test.js)",
+      "Bash(/Users/felix/.nvm/versions/node/v25.4.0/bin/node --check engine/film.js)",
+      "Bash(/Users/felix/.nvm/versions/node/v25.4.0/bin/node --check engine/inspect.js)",
+      "Bash(/Users/felix/.nvm/versions/node/v25.4.0/bin/node --check llm-inference/machine.js)",
+      "Bash(/Users/felix/.nvm/versions/node/v25.4.0/bin/node -e ' *)"
+    ]
+  }
+}

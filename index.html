@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D explainers</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎬</text></svg>">
+<style>
+  :root { --bg:#05080d; --panel:rgba(13,18,26,.82); --line:rgba(255,255,255,.10);
+          --text:#e8eef6; --muted:#8a98ab; --accent:#4ecdc4;
+          --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+          --mono: ui-monospace, "SF Mono", Menlo, monospace; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; background:
+           radial-gradient(70% 60% at 50% 0%, #0a1522 0%, var(--bg) 70%);
+         color:var(--text); font-family:var(--sans); -webkit-font-smoothing:antialiased;
+         display:grid; place-items:center; padding:48px 24px; }
+  main { width:100%; max-width:760px; }
+  .eyebrow { font-size:11px; letter-spacing:.28em; text-transform:uppercase; color:var(--accent); }
+  h1 { margin:14px 0 8px; font-size:clamp(30px,5vw,46px); letter-spacing:-.03em; line-height:1.05; }
+  .lede { margin:0 0 34px; color:#b6c3d2; font-size:15px; line-height:1.7; max-width:56ch; }
+  ul { list-style:none; margin:0; padding:0; display:grid; gap:12px; }
+  a.card { display:block; padding:20px 22px; border:1px solid var(--line); border-radius:14px;
+           background:var(--panel); text-decoration:none; color:inherit;
+           transition:border-color .15s, transform .15s, background .15s; }
+  a.card:hover { border-color:rgba(78,205,196,.5); background:rgba(78,205,196,.07); transform:translateY(-2px); }
+  a.card h2 { margin:0 0 5px; font-size:18px; letter-spacing:-.01em; }
+  a.card h2 .ico { margin-right:10px; }
+  a.card p { margin:0; font-size:13.5px; line-height:1.6; color:var(--muted); }
+  a.card .meta { margin-top:10px; font-family:var(--mono); font-size:11px; color:#6d7c8f; }
+  .note { margin-top:34px; padding-top:20px; border-top:1px solid var(--line);
+          font-size:13px; line-height:1.7; color:var(--muted); }
+  code { font-family:var(--mono); font-size:12px; background:rgba(255,255,255,.07);
+         padding:2px 6px; border-radius:5px; color:#cfe6ff; }
+</style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Three.js</div>
+  <h1>3D explainers</h1>
+  <p class="lede">Chaptered animations built on a shared engine. Each one supplies its own
+     subject; the renderer, camera choreography, narration and transport come from
+     <code>engine/</code>.</p>
+
+  <ul>
+    <li><a class="card" href="./protein-synthesis/">
+      <h2><span class="ico">🧬</span>Protein Synthesis</h2>
+      <p>How a cell turns a gene into a working protein, following the real human
+         <i>HBB</i> gene from chromatin to folded haemoglobin — then breaking it with
+         a single base change.</p>
+      <div class="meta">10 chapters · 6:38 silent · 10:54 narrated</div>
+    </a></li>
+
+    <li><a class="card" href="./llm-inference/">
+      <h2><span class="ico">⚡</span>LLM Inference</h2>
+      <p>Why generating text is a memory problem: prefill, decode, the KV cache,
+         batching, quantization and speculative decoding — one honest machine, every
+         number derived, three live toggles.</p>
+      <div class="meta">9 chapters · interactive · per-chapter deep dives</div>
+    </a></li>
+
+    <li><a class="card" href="./kubernetes/">
+      <h2><span class="ico">☸️</span>Kubernetes, in 3D</h2>
+      <p>What a cluster actually does: the control plane, pods, the scheduler, the
+         control loop, self-healing, services, scaling and rolling updates.</p>
+      <div class="meta">standalone — not on the shared engine</div>
+    </a></li>
+
+    <li><a class="card" href="./template/">
+      <h2><span class="ico">✳️</span>Template</h2>
+      <p>Two-chapter starter showing the whole engine surface. Copy this directory to
+         begin a new film.</p>
+      <div class="meta">2 chapters · 0:32</div>
+    </a></li>
+  </ul>
+
+  <p class="note">Serve over HTTP — ES modules will not load from <code>file://</code>.
+     Run <code>node serve.js</code> and open <code>localhost:8731</code>.</p>
+</main>
+</body>
+</html>
