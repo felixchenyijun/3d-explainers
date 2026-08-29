@@ -1,0 +1,118 @@
+#!/usr/bin/env node
+// Assembles deep.html + deep/figs.js from the deep-dive workflow's output.
+// Run: node gen_deep.mjs <sections.json>   (array of section objects)
+import { readFileSync, writeFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+const ROOT = dirname(fileURLToPath(import.meta.url));
+const sections = JSON.parse(readFileSync(process.argv[2] ?? join(ROOT, 'deep-sections.json'), 'utf8'));
+
+const esc = (s) => String(s).replace(/&(?![a-z#0-9]+;)/g, '&amp;');
+
+// practice code: comments → .c, keys → .k, ⟦..⟧ → .hi
+const codeize = (txt) => txt.trim().split('\n').map((line) => {
+  line = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  line = line.replace(/(#.*)$/, '<span class="c">$1</span>');
+  line = line.replace(/^(\s*(?:-\s+)?)([\w./$-]+)(:)/, '$1<span class="k">$2</span>$3');
+  line = line.replaceAll('⟦', '<span class="hi">').replaceAll('⟧', '</span>');
+  return line;
+}).join('\n');
+
+const two = (n) => String(n + 1).padStart(2, '0');
+
+const tocHtml = sections.map((S, i) =>
+  `      <a href="#s-${S.id}"><span class="n">${two(i)}</span><span>${esc(S.title)}</span></a>`).join('\n');
+
+const secHtml = sections.map((S, i) => `
+  <section class="sec" id="s-${S.id}">
+    <p class="kicker"><span class="n">${two(i)}</span> <span>${esc(S.kicker)}</span></p>
+    <h2>${esc(S.title)}</h2>
+    <div class="prose">
+${S.paras.slice(0, 2).map(p => `      <p>${esc(p)}</p>`).join('\n')}
+    </div>
+    <figure data-fig="${S.id}">
+      <figcaption>${esc(S.caption)}</figcaption>
+    </figure>
+    <div class="prose">
+${S.paras.slice(2).map(p => `      <p>${esc(p)}</p>`).join('\n')}
+    </div>
+    <div class="wrong">
+      <div><span class="tag">the wrong picture</span><p>${esc(S.misconception.wrong)}</p></div>
+      <div><span class="tag">what actually happens</span><p>${esc(S.misconception.right)}</p></div>
+    </div>
+    <div class="practice">
+      <div class="ph"><span class="t">${esc(S.practice.title)}</span><span class="f">${esc(S.practice.file)}</span></div>
+      <pre>${codeize(S.practice.code)}</pre>
+      <div class="pnote">${esc(S.practice.note)}</div>
+    </div>
+    <div class="pattern"><span class="tag">worth stealing</span><p>${esc(S.pattern)}</p></div>
+  </section>`).join('\n');
+
+const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Inference, Deeply — the machine behind the tokens</title>
+<meta name="description" content="A written deep dive into LLM inference infrastructure — the roofline, weights, the forward pass, the KV cache, prefill, decode, batching and serving schedulers, quantization, speculative decoding, long context, multi-GPU, and the economics — with an animated figure for every section.">
+<link rel="stylesheet" href="deep.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>⚡</text></svg>">
+</head>
+<body>
+
+<div id="readbar"></div>
+
+<header id="topbar">
+  <div class="mark">⚡</div>
+  <span class="t">LLM Inference</span>
+  <span class="sep">/</span>
+  <span class="t" style="color:var(--dim)">deeply</span>
+  <nav><a href="index.html">3D film →</a></nav>
+</header>
+
+<section id="hero">
+  <p class="eyebrow">llm inference · part two · the machine, in writing</p>
+  <h1>LLM Inference, Deeply</h1>
+  <div class="lede">
+    <p>The film showed you the machine: a wire, two territories, and a 14&nbsp;GB read buying one token. This is the same machine with the case off — the whole pipeline from prompt to sampled token, the cache that runs the industry, the scheduler juggling it, and the arithmetic that turns bandwidth into a price sheet.</p>
+    <p>Each section opens with a few paragraphs of setup, then an animated figure does the mechanism, then the mechanics continue underneath. The <i>in&nbsp;practice</i> blocks show where each idea surfaces in real serving stacks, and every section ends with the pattern worth stealing for systems that have nothing to do with GPUs.</p>
+  </div>
+  <div class="meta">
+    <span>${sections.length} sections</span><span>~35 min · figures replayable</span><span>every number derived from one machine model</span><span><a href="index.html">watch the 3D film ↩</a></span>
+  </div>
+</section>
+
+<div id="frame">
+  <nav id="toc" aria-label="Sections">
+    <div class="toc-head">sections</div>
+${tocHtml}
+  </nav>
+
+  <main>
+${secHtml}
+  </main>
+</div>
+
+<footer id="foot">
+  <a href="index.html">← The 3D film: nine chapters, live toggles, hover the machine</a>
+  <div class="sub">Every figure on this page derives from the same idealized machine as the film: one H100 (989 TFLOP/s bf16 · 3.35 TB/s · 80 GB), one 7B dense model. Real stacks reach a fraction of the ideal; the shape of the numbers is the lesson.</div>
+</footer>
+
+<script type="module" src="deep/main.js"></script>
+</body>
+</html>
+`;
+
+const figs = `// figs.js — GENERATED by gen_deep.mjs from the deep-dive workflow output.
+// One animated SVG builder per section, run by engine/fig.js.
+${sections.map(S => S.fig.js).join('\n\n')}
+
+export const FIGS = {
+${sections.map(S => `  ${S.id}: { build: fig_${S.id}, height: ${S.fig.height}, dur: ${S.fig.dur} },`).join('\n')}
+};
+`;
+
+writeFileSync(join(ROOT, 'deep.html'), html);
+writeFileSync(join(ROOT, 'deep/figs.js'), figs);
+console.log(`deep.html: ${sections.length} sections, ${(html.length / 1024).toFixed(0)} KB; figs.js ${(figs.length / 1024).toFixed(0)} KB`);

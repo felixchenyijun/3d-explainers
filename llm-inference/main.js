@@ -54,7 +54,7 @@ createFilm({
   intro: {
     eyebrow: 'An interactive explainer',
     headline: 'Why is <em>generating</em> text so hard?',
-    body: 'A GPU that can do a quadrillion operations per second spends most of its life waiting on memory. This film builds LLM inference from first principles — prefill, decode, KV cache, batching, quantization, speculative decoding — on one honest machine whose every number you can check. Drag to orbit any scene; each chapter has a deep-dive article if you want the full story.',
+    body: 'A GPU that can do a quadrillion operations per second spends most of its life waiting on memory. This film builds LLM inference from first principles — prefill, decode, KV cache, batching, quantization, speculative decoding — on one honest machine whose every number you can check. Drag to orbit any scene; each chapter has a deep-dive article if you want the full story. Prefer reading? <a href="deep.html" style="color:var(--accent)">LLM Inference, Deeply — the written companion →</a>',
     cta: 'Begin',
   },
   camera: { fov: 46, near: 0.1, far: 2000, start: [0, 10, 95], min: 6, max: 400 },
