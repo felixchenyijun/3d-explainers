@@ -128,6 +128,9 @@ details.tbl table { border-collapse: collapse; font-size: 12px; font-variant-num
 details.tbl th, details.tbl td { padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
 details.tbl th:first-child, details.tbl td:first-child { text-align: left; }
 
+.fp-ctl .lab { font-size: 12.5px; color: var(--ink-2); font-weight: 600; }
+.fp-ctl output { font-family: var(--mono); font-weight: 500; color: var(--ink); }
+.fp-ctl input[type=range] { accent-color: var(--accent); width: 130px; max-width: 100%; }
 .method { columns: 2 320px; column-gap: 32px; font-size: 14px; color: var(--ink-2); }
 .method p { margin: 0 0 12px; break-inside: avoid; }
 .method b { color: var(--ink); }
@@ -218,6 +221,27 @@ footer { padding-block: 28px 48px; font-size: 12px; color: var(--muted); }
       <div class="panel" style="padding:8px 4px 8px 8px"><div class="legend" id="x-legend" style="padding:4px 8px 0"></div><div id="xchart"></div></div>
       <aside class="panel detail" id="detail" aria-live="polite"><p class="empty">Select a company to see its story, funding rounds and sources.</p></aside>
     </div>
+  </section>
+
+  <section id="founders">
+    <h2>What founders actually take home</h2>
+    <p class="sub">An exit's value isn't founder money. This estimates each founder's share after dilution and after investors are paid back, spread over the years they spent on the company. It covers every company from 2005–2019 batches, including the ones that died. Move the assumptions to see how much they matter.</p>
+    <div class="xbar fp-ctl">
+      <label class="lab" for="fp-n">Founders per company <output id="fp-n-o">2.4</output></label>
+      <input type="range" id="fp-n" min="1" max="4" step="0.1" value="2.4">
+      <label class="lab" for="fp-s">Salary <output id="fp-s-o">$90K</output>/yr</label>
+      <input type="range" id="fp-s" min="0" max="200000" step="10000" value="90000">
+      <span class="lab" id="fp-d-lab">Dilution</span>
+      <div class="seg" id="fp-d" role="group" aria-labelledby="fp-d-lab"><button data-v="light" aria-pressed="false">Light</button><button data-v="typical" aria-pressed="true">Typical</button><button data-v="heavy" aria-pressed="false">Heavy</button></div>
+      <label class="chk"><input type="checkbox" id="fp-p" checked> Investors get their money back first</label>
+    </div>
+    <div class="tiles" id="fp-tiles"></div>
+    <div class="panel" style="margin-top:12px">
+      <div class="legend" id="fp-legend"></div>
+      <div class="scroll-x"><svg id="fp-chart" role="img" aria-label="Founder equity per year by percentile"></svg></div>
+      <div class="scroll-x" id="fp-table"></div>
+    </div>
+    <p class="note" id="fp-note"></p>
   </section>
 
   <section id="method">
@@ -628,6 +652,92 @@ function renderExplorer() {
   if (state.sel != null && cs.some(c => c.i === state.sel)) renderDetail(C[state.sel]);
 }
 
+/* ---------- 7. founder take-home ---------- */
+const FP = { founders: 2.4, salary: 90e3, dil: 'typical', prefs: true };
+// founder team's combined stake at exit by last stage reached: none, seed, A, B, C, D+ (approx. industry medians)
+const STAKES = { light: [.85, .62, .44, .31, .24, .18], typical: [.80, .56, .36, .23, .17, .12], heavy: [.75, .48, .28, .17, .12, .08] };
+const RAISED_DEF = [1.5e5, 2e6, 12e6, 40e6, 90e6, 250e6];   // used when total raised wasn't found
+const POOL = .12, PRE_YC = .5, BIGTECH = 350e3;
+function fStage(c) {
+  const rank = {'pre-seed': 1, 'seed': 1, 'undisclosed': 1, 'crowdfunding': 1, 'series-a': 2, 'series-b': 3, 'series-c': 4, 'series-d+': 5, 'growth': 5};
+  let s = Math.max(0, ...(c.r || []).map(r => rank[STAGES[r[1]]] || 0));
+  if (s === 0 && (c.tr || 0) > 3e5) s = 1;
+  if (c.o === 'ipo') s = Math.max(s, 4);
+  return s;
+}
+function teamPayout(c) {
+  if (!['ipo', 'acq', 'merged'].includes(c.o)) return 0;   // acquihires pay in jobs; dead, dormant and operating companies have paid nothing yet
+  const V = c.xv ?? TIER_MID[c.xr] ?? 3e6, s = fStage(c), stake = STAKES[FP.dil][s], R = c.tr || RAISED_DEF[s];
+  const fInv = Math.max(.07, 1 - stake - POOL);
+  if (c.o === 'ipo' || !FP.prefs || fInv * V >= R) return stake * V;   // investors convert: everyone shares pro rata
+  return Math.max(0, V - R) * stake / (stake + POOL);                 // 1x preference: investors are paid back first
+}
+function renderFounders() {
+  const rows = S().filter(c => c.B.t0 <= MATURE_T0).map(c => {
+    const end = isExit(c) ? c.xt : (c.o === 'dead' || c.o === 'zombie' || c.o === 'unknown') ? c.dt : D.asOf;
+    const yrs = Math.max(.75, Math.min(end ?? D.asOf, D.asOf) - c.B.t0 + PRE_YC);
+    const eq = teamPayout(c) / FP.founders;
+    return {c, yrs, eq, eqy: eq / yrs};
+  }).sort((a, b) => a.eqy - b.eqy);
+  const n = rows.length; if (!n) return;
+  const q = p => rows[Math.min(n - 1, Math.floor(p / 100 * n))];
+  const zero = rows.filter(r => r.eq <= 0).length;
+  const sumEq = d3.sum(rows, r => r.eq), sumYrs = d3.sum(rows, r => r.yrs);
+  const byCo = rows.slice().sort((a, b) => b.eq - a.eq), top10 = d3.sum(byCo.slice(0, 10), r => r.eq);
+  const meanNoTop = (sumEq - top10) / (sumYrs - d3.sum(byCo.slice(0, 10), r => r.yrs));
+  const med = q(50);
+  const tiles = [
+    {k: 'Median earnings per year', v: fmtUSD(FP.salary + med.eqy), d: `your salary setting plus ${fmtUSD(med.eqy)} a year from equity`, hero: true},
+    {k: 'Get any equity payout', v: pct(n - zero, n, 0), d: `${pct(rows.filter(r => r.eq >= 1e6).length, n, 0)} of founders get $1M or more, ${pct(rows.filter(r => r.eq >= 1e7).length, n, 1)} get $10M or more`},
+    {k: 'Average equity per founder-year', v: fmtUSD(sumEq / sumYrs), d: `${pct(top10, sumEq, 0)} of it comes from just 10 companies`},
+    {k: 'Average without those 10', v: fmtUSD(meanNoTop), d: 'equity per founder-year, the other companies only'},
+    {k: 'Typical time in the company', v: d3.median(rows, r => r.yrs).toFixed(1) + 'y', d: 'median, from about 6 months before YC to the exit, shutdown or today'},
+  ];
+  const T = document.getElementById('fp-tiles'); T.replaceChildren();
+  tiles.forEach(t => { const d = el('div', {class: 'tile' + (t.hero ? ' hero' : '')}); d.append(el('div', {class: 'k'}, t.k), el('div', {class: 'v'}, t.v), el('div', {class: 'd'}, t.d)); T.append(d); });
+  // quantile chart: percentile of founders (x) vs equity per year (log y)
+  const W = 1040, H = 380, m = {l: 64, r: 24, t: 16, b: 40};
+  const x = d3.scaleLinear([0, 100], [m.l, W - m.r]);
+  const y = d3.scaleLog([1e4, 5e7], [H - m.b, m.t]).clamp(true);
+  const svg = d3.select('#fp-chart').attr('viewBox', `0 0 ${W} ${H}`).attr('width', '100%').style('min-width', '640px');
+  svg.selectAll('*').remove();
+  legend('fp-legend', [[col('big'), 'Equity per founder per year, by percentile', 'ln'], [css('--ink-2'), `Salary setting (${fmtUSD(FP.salary)})`, 'ln'], [col('dead'), `Typical senior big-tech pay (~${fmtUSD(BIGTECH)})`, 'ln']]);
+  const yt = [1e4, 1e5, 1e6, 1e7];
+  svg.append('g').attr('class', 'grid').selectAll('line').data(yt).join('line').attr('x1', m.l).attr('x2', W - m.r).attr('y1', y).attr('y2', y);
+  svg.append('g').attr('transform', `translate(${m.l},0)`).call(d3.axisLeft(y).tickValues(yt).tickSize(0).tickFormat(v => fmtUSD(v) + '/yr')).call(g => g.select('.domain').remove());
+  svg.append('g').attr('transform', `translate(0,${H - m.b})`).attr('class', 'axis').call(d3.axisBottom(x).tickValues([0, 25, 50, 75, 90, 100]).tickSize(4).tickFormat(v => v + 'th'));
+  svg.append('text').attr('x', W - m.r).attr('y', H - 4).attr('text-anchor', 'end').text('percentile of founders →');
+  const zx = x(100 * zero / n);
+  svg.append('rect').attr('x', m.l).attr('y', m.t).attr('width', Math.max(0, zx - m.l)).attr('height', H - m.t - m.b).attr('fill', css('--grid')).attr('opacity', .55);
+  svg.append('text').attr('x', (m.l + zx) / 2).attr('y', H - m.b - 14).attr('text-anchor', 'middle').attr('class', 'ink2').style('font-size', '12px').text(`${pct(zero, n, 0)} of founders: $0 from equity`);
+  const pos = rows.map((r, k) => ({p: 100 * (k + .5) / n, v: r.eqy, r})).filter(d => d.v > 0);
+  svg.append('path').attr('d', d3.line().curve(d3.curveStepAfter).x(d => x(d.p)).y(d => y(d.v))(pos)).attr('fill', 'none').attr('stroke', col('big')).attr('stroke-width', 2.5);
+  [[FP.salary, css('--ink-2'), `salary ${fmtUSD(FP.salary)}`], [BIGTECH, col('dead'), `big-tech ~${fmtUSD(BIGTECH)}`]].forEach(([v, c, lab], k) => {
+    if (v <= 0) return;
+    svg.append('line').attr('x1', m.l).attr('x2', W - m.r).attr('y1', y(v)).attr('y2', y(v)).attr('stroke', c).attr('stroke-width', 1.5).attr('stroke-dasharray', '5 4');
+    svg.append('text').attr('x', m.l + 6).attr('y', y(v) - 5).attr('class', 'ink2').text(lab);
+  });
+  [75, 90, 95, 99].forEach(p => { const r = q(p); if (r.eqy <= 0) return; svg.append('circle').attr('cx', x(p)).attr('cy', y(r.eqy)).attr('r', 4).attr('fill', col('big')).attr('stroke', css('--surface')).attr('stroke-width', 2); svg.append('text').attr('x', x(p) - 6).attr('y', y(r.eqy) - 8).attr('text-anchor', 'end').attr('class', 'ink').style('font-size', '12px').text(`${p}th: ${fmtUSD(r.eqy)}/yr`); });
+  const cross = svg.append('line').attr('y1', m.t).attr('y2', H - m.b).attr('stroke', css('--axis')).attr('visibility', 'hidden');
+  svg.append('rect').attr('x', m.l).attr('y', m.t).attr('width', W - m.l - m.r).attr('height', H - m.t - m.b).attr('fill', 'transparent')
+    .on('pointermove', ev => {
+      const [px] = d3.pointer(ev); const p = Math.max(0, Math.min(99.9, x.invert(px))); const r = q(p);
+      cross.attr('x1', x(p)).attr('x2', x(p)).attr('visibility', 'visible');
+      showTip(ev, Tt => { Tt.append(el('div', {class: 't'}, `${Math.round(p)}th percentile founder`)); tipRow(Tt, col('big'), fmtUSD(r.eqy) + '/yr', 'from equity'); tipRow(Tt, css('--ink-2'), fmtUSD(FP.salary + r.eqy) + '/yr', 'with salary'); Tt.append(el('div', {class: 'm'}, r.eq > 0 ? `e.g. ${r.c.n} (${short(r.c.B.name)}): ${fmtUSD(r.eq)} per founder over ${r.yrs.toFixed(1)} years` : 'no equity payout (shut down, dormant, acquihired, or still private)')); });
+    })
+    .on('pointerleave', () => { cross.attr('visibility', 'hidden'); hideTip(); });
+  // table view
+  const tbl = el('table', {class: 'mini'}); const hr = el('tr'); ['Percentile', 'Equity, total per founder', 'Equity per year', 'With salary, per year'].forEach(h => hr.append(el('th', {}, h))); tbl.append(hr);
+  [50, 75, 80, 90, 95, 99].forEach(p => { const r = q(p); const tr = el('tr'); [p + 'th', fmtUSD(r.eq), fmtUSD(r.eqy), fmtUSD(FP.salary + r.eqy)].forEach(v => tr.append(el('td', {}, v))); tbl.append(tr); });
+  const mr = el('tr'); ['Average', fmtUSD(sumEq / n), fmtUSD(sumEq / sumYrs), fmtUSD(FP.salary + sumEq / sumYrs)].forEach(v => mr.append(el('td', {}, v))); tbl.append(mr);
+  document.getElementById('fp-table').replaceChildren(tbl);
+  document.getElementById('fp-note').textContent = `${n.toLocaleString()} companies${state.ind === 'all' ? '' : ' in ' + state.ind}. Assumptions: founders split their stake evenly. The founding team's combined stake at exit depends on the last round reached (${STAKES[FP.dil].map(v => Math.round(v * 100) + '%').join(' / ')} for no raise after YC / seed / A / B / C / D+), with a 12% employee pool. With preferences on, investors get their money back before founders in sales for less than the capital raised. Acquihires count as $0 because they pay in jobs and retention bonuses. Companies still operating also count as $0, so the paper value of live unicorns and any shares founders sold in later rounds are left out, which understates the top end. Small undisclosed deals sit at their estimated size, and IPO stakes are valued at the listing price. Big-tech pay is a rough reference for a senior engineer's total compensation.`;
+}
+document.getElementById('fp-n').addEventListener('input', e => { FP.founders = +e.target.value; document.getElementById('fp-n-o').textContent = FP.founders.toFixed(1); renderFounders(); });
+document.getElementById('fp-s').addEventListener('input', e => { FP.salary = +e.target.value; document.getElementById('fp-s-o').textContent = fmtUSD(FP.salary); renderFounders(); });
+document.getElementById('fp-p').addEventListener('change', e => { FP.prefs = e.target.checked; renderFounders(); });
+document.getElementById('fp-d').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; FP.dil = b.dataset.v; document.getElementById('fp-d').querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', x === b)); renderFounders(); });
+
 /* ---------- method + footer ---------- */
 function renderMethod() {
   const M = document.getElementById('method-body'); M.replaceChildren();
@@ -635,7 +745,7 @@ function renderMethod() {
   document.getElementById('foot').textContent = D.foot || '';
 }
 
-function renderAll() { renderOdds(); renderCurves(); renderBatches(); renderExits(); renderFunding(); renderExplorer(); }
+function renderAll() { renderOdds(); renderCurves(); renderBatches(); renderExits(); renderFunding(); renderExplorer(); renderFounders(); }
 state.batch = live.filter(i => B[i].t0 <= MATURE_T0).at(-1) ?? live.at(-1);
 xbatch.value = state.batch;
 document.getElementById('eyebrow').textContent = `Every Y Combinator company · ${C.length.toLocaleString()} companies · ${live.length} batches · data as of ${D.asOfLabel}`;
